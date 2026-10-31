@@ -96,6 +96,47 @@ python3 manage.py backup "backups/commonground-$(date +%F-%H%M%S).sqlite3"
 
 A backup contains account and booking data; protect it as sensitive information. Never copy an existing backup over another backup.
 
+## Verification Workflow
+
+CommonGround includes a comprehensive verification system for users and resources:
+
+### User Verification
+- **Members** can request ID verification for themselves via `/api/verification/request`
+- **Managers/Admins** view pending requests via `/api/admin/verifications`
+- **Managers/Admins** approve or reject requests via `PATCH /api/admin/verify`
+- State machine: unverified → pending → verified/rejected
+- Self-verification is blocked (403 if user tries to verify themselves)
+
+### Resource Verification
+- **Owners** can request resource verification
+- **Managers/Admins** can approve/reject resource verification (but not their own)
+- Verification resets to 'unverified' if material edits are made to a verified resource
+
+### API Endpoints
+- `POST /api/verification/request` - Request verification (user on self, resource on owner)
+- `GET /api/admin/verifications` - Queue for managers/admins (filter by status)
+- `PATCH /api/admin/verify` - Approve/reject with reason (required for reject)
+- `GET /api/verification/history?target_type=user&target_id=xxx` - Audit trail
+- `GET /api/notifications` - List own notifications with unread count
+- `POST /api/notifications/read` - Mark notifications as read
+
+### Demo Mode
+
+Set `CG_DEMO_MODE=1` for a demo deployment with pre-seeded accounts:
+
+| Role | Account | Password |
+|---|---|---|
+| Member | `member@campus.example` | demo-password-123 |
+| Owner | `owner@campus.example` | demo-password-123 |
+| Manager | `manager@campus.example` | demo-password-123 |
+
+For the judge deployment, set:
+```bash
+export CG_DEMO_MODE=1
+```
+
+This seeds demo accounts and resources in various verification states for testing.
+
 ## Configure a deployment
 
 Docker, Docker Compose and a DNS hostname pointing to the host are needed for the supplied single-instance deployment. Caddy terminates TLS; Compose keeps the Python service private and stores SQLite in the persistent `ground-data` volume. Set the two environment values through a deployment secret/environment manager, not source control:
