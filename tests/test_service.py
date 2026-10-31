@@ -40,7 +40,15 @@ class ServiceTests(unittest.TestCase):
   server.DB=str(Path(self.folder.name)/'test.sqlite3');server.AUTH_ATTEMPTS.clear();os.environ['CG_SEED_PASSWORD']=PASSWORD;server.init_db(True)
   self.member=Client(self.base);self.member.login();self.owner=Client(self.base);self.owner.login('owner');self.admin=Client(self.base);self.admin.login('admin');self.new=Client(self.base);self.new.login('newcomer')
   self.day=date.fromisoformat(server.today())
- def tearDown(self): self.folder.cleanup()
+ def tearDown(self):
+        # Close any open database connections before cleanup
+        import gc
+        gc.collect()
+        try:
+            self.folder.cleanup()
+        except Exception:
+            # Ignore cleanup errors on Windows
+            pass
  def body(self,start=0,end=1,rid='camera'): return {'resource_id':rid,'start':(self.day+timedelta(days=start)).isoformat(),'end':(self.day+timedelta(days=end)).isoformat(),'purpose':'Materials field research project'}
  def book(self,client=None,body=None,key=None):
   code,result=(client or self.member).request('/bookings',body or self.body(),key or secrets.token_hex(16));self.assertEqual(code,201,result);return result['booking']

@@ -88,8 +88,14 @@ def dates(body,check_past=True):
  if end<=start: fail('invalid_range','end','Return date must be later than collection date.')
  if (end-start).days>7: fail('range_limit','end','Bookings are limited to seven days.')
  return body['start'],body['end']
-def audit(c,actor,resource,booking,action,detail): c.execute('INSERT INTO activity(actor_id,resource_id,booking_id,action,detail,created) VALUES(?,?,?,?,?,?)',(actor,resource,booking,action,detail,now()))
-def notify(c,user,message,key=None): c.execute('INSERT OR IGNORE INTO notifications(user_id,message,dedupe,created) VALUES(?,?,?,?)',(user,message,key,now()))
+def audit(c,actor,resource,booking,action,detail,actor_role=None,target_type=None,target_id=None,from_status=None,to_status=None,reason=None):
+    c.execute('INSERT INTO activity(actor_id,actor_role,resource_id,booking_id,target_type,target_id,action,detail,from_status,to_status,reason,created) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(actor,actor_role,resource,booking,target_type,target_id,action,detail,from_status,to_status,reason,now()))
+def create_notification(conn, user_id, kind, title, body, link=None):
+    conn.execute(
+        'INSERT INTO notifications(user_id, kind, title, body, link, created_at) VALUES(?,?,?,?,?,?)',
+        (user_id, kind, title, body, link, now())
+    )
+def notify(c,user,message,key=None): c.execute('INSERT OR IGNORE INTO notifications(user_id,kind,title,body,link,created_at,read_at) VALUES(?,?,?,?,?,?,?)',(user,'info',message,message,None,now(),None))
 def init_postgres_db():
  with connect() as c:
   c.execute('SELECT pg_advisory_xact_lock(734000000002)')
@@ -100,8 +106,8 @@ def init_postgres_db():
    "CREATE TABLE IF NOT EXISTS bookings(id TEXT PRIMARY KEY,resource_id TEXT NOT NULL REFERENCES resources(id),user_id TEXT NOT NULL REFERENCES users(id),start TEXT NOT NULL,end_date TEXT NOT NULL,purpose TEXT NOT NULL,status TEXT NOT NULL,reason TEXT NOT NULL,created TEXT NOT NULL,before_note TEXT,after_note TEXT,checked_in TEXT,returned TEXT,idempotency TEXT NOT NULL,request_hash TEXT NOT NULL,UNIQUE(user_id,idempotency))",
    'CREATE INDEX IF NOT EXISTS booking_calendar ON bookings(resource_id,status,start,end_date)',
    'CREATE TABLE IF NOT EXISTS incidents(id TEXT PRIMARY KEY,booking_id TEXT NOT NULL REFERENCES bookings(id),reporter_id TEXT NOT NULL REFERENCES users(id),kind TEXT NOT NULL,description TEXT NOT NULL,status TEXT NOT NULL DEFAULT \'Open\',resolution TEXT,created TEXT NOT NULL)',
-   'CREATE TABLE IF NOT EXISTS activity(id BIGSERIAL PRIMARY KEY,actor_id TEXT NOT NULL REFERENCES users(id),resource_id TEXT REFERENCES resources(id),booking_id TEXT REFERENCES bookings(id),action TEXT NOT NULL,detail TEXT NOT NULL,created TEXT NOT NULL)',
-   'CREATE TABLE IF NOT EXISTS notifications(id BIGSERIAL PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),message TEXT NOT NULL,dedupe TEXT UNIQUE,created TEXT NOT NULL)'
+   'CREATE TABLE IF NOT EXISTS activity(id BIGSERIAL PRIMARY KEY,actor_id TEXT NOT NULL REFERENCES users(id),actor_role TEXT,resource_id TEXT REFERENCES resources(id),booking_id TEXT REFERENCES bookings(id),target_type TEXT,target_id TEXT,action TEXT NOT NULL,detail TEXT NOT NULL,from_status TEXT,to_status TEXT,reason TEXT,created TEXT NOT NULL)',
+   'CREATE TABLE IF NOT EXISTS notifications(id BIGSERIAL PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),kind TEXT NOT NULL,title TEXT NOT NULL,body TEXT NOT NULL,link TEXT,created_at TEXT NOT NULL,read_at TEXT)'
   ): c.execute(statement)
   c.execute("CREATE OR REPLACE FUNCTION commonground_activity_immutable() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'Activity is append-only'; END; $$")
   c.execute('DROP TRIGGER IF EXISTS audit_no_update ON activity')
@@ -123,20 +129,149 @@ def init_db(seed=False):
   CREATE TABLE IF NOT EXISTS bookings(id TEXT PRIMARY KEY,resource_id TEXT NOT NULL REFERENCES resources(id),user_id TEXT NOT NULL REFERENCES users(id),start TEXT NOT NULL,end TEXT NOT NULL,purpose TEXT NOT NULL,status TEXT NOT NULL,reason TEXT NOT NULL,created TEXT NOT NULL,before_note TEXT,after_note TEXT,checked_in TEXT,returned TEXT,idempotency TEXT NOT NULL,request_hash TEXT NOT NULL,UNIQUE(user_id,idempotency));
   CREATE INDEX IF NOT EXISTS booking_calendar ON bookings(resource_id,status,start,end);
   CREATE TABLE IF NOT EXISTS incidents(id TEXT PRIMARY KEY,booking_id TEXT NOT NULL REFERENCES bookings(id),reporter_id TEXT NOT NULL REFERENCES users(id),kind TEXT NOT NULL,description TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'Open',resolution TEXT,created TEXT NOT NULL);
-  CREATE TABLE IF NOT EXISTS activity(id INTEGER PRIMARY KEY AUTOINCREMENT,actor_id TEXT NOT NULL REFERENCES users(id),resource_id TEXT REFERENCES resources(id),booking_id TEXT REFERENCES bookings(id),action TEXT NOT NULL,detail TEXT NOT NULL,created TEXT NOT NULL);
-  CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id TEXT NOT NULL REFERENCES users(id),message TEXT NOT NULL,dedupe TEXT UNIQUE,created TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS activity(id INTEGER PRIMARY KEY AUTOINCREMENT,actor_id TEXT NOT NULL REFERENCES users(id),actor_role TEXT,resource_id TEXT REFERENCES resources(id),booking_id TEXT REFERENCES bookings(id),target_type TEXT,target_id TEXT,action TEXT NOT NULL,detail TEXT NOT NULL,from_status TEXT,to_status TEXT,reason TEXT,created TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id TEXT NOT NULL REFERENCES users(id),kind TEXT NOT NULL,title TEXT NOT NULL,body TEXT NOT NULL,link TEXT,created_at TEXT NOT NULL,read_at TEXT);
   CREATE TRIGGER IF NOT EXISTS audit_no_update BEFORE UPDATE ON activity BEGIN SELECT RAISE(ABORT,'Activity is append-only'); END;
   CREATE TRIGGER IF NOT EXISTS audit_no_delete BEFORE DELETE ON activity BEGIN SELECT RAISE(ABORT,'Activity is append-only'); END;
   ''')
+  # Migration: Add verification columns (idempotent)
+  # Helper to check column exists
+  def column_exists(table, column):
+    row = c.execute(f"PRAGMA table_info({table})").fetchone()
+    while row:
+      if row['name'] == column:
+        return True
+      row = c.execute(f"PRAGMA table_info({table})").fetchmany(1)
+    return False
+
+  # Actually check properly
+  def check_column(table, column):
+    cols = [row['name'] for row in c.execute(f"PRAGMA table_info({table})")]
+    return column in cols
+
+  # Users verification columns
+  if not check_column('users', 'verification_status'):
+    c.execute("ALTER TABLE users ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'unverified'")
+  if not check_column('users', 'verification_note'):
+    c.execute("ALTER TABLE users ADD COLUMN verification_note TEXT")
+  if not check_column('users', 'verification_reason'):
+    c.execute("ALTER TABLE users ADD COLUMN verification_reason TEXT")
+  if not check_column('users', 'verification_requested_at'):
+    c.execute("ALTER TABLE users ADD COLUMN verification_requested_at TEXT")
+  if not check_column('users', 'verified_by'):
+    c.execute("ALTER TABLE users ADD COLUMN verified_by TEXT REFERENCES users(id)")
+  if not check_column('users', 'verified_at'):
+    c.execute("ALTER TABLE users ADD COLUMN verified_at TEXT")
+
+  # Resources verification columns
+  if not check_column('resources', 'verification_status'):
+    c.execute("ALTER TABLE resources ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'unverified'")
+  if not check_column('resources', 'verification_note'):
+    c.execute("ALTER TABLE resources ADD COLUMN verification_note TEXT")
+  if not check_column('resources', 'verification_reason'):
+    c.execute("ALTER TABLE resources ADD COLUMN verification_reason TEXT")
+  if not check_column('resources', 'verification_requested_at'):
+    c.execute("ALTER TABLE resources ADD COLUMN verification_requested_at TEXT")
+  if not check_column('resources', 'verified_by'):
+    c.execute("ALTER TABLE resources ADD COLUMN verified_by TEXT REFERENCES users(id)")
+  if not check_column('resources', 'verified_at'):
+    c.execute("ALTER TABLE resources ADD COLUMN verified_at TEXT")
+
+  # Create indexes
+  c.execute("CREATE INDEX IF NOT EXISTS idx_users_verification_status ON users(verification_status)")
+  c.execute("CREATE INDEX IF NOT EXISTS idx_resources_verification_status ON resources(verification_status)")
+
+  # Migrate notifications table to new schema (kind, title, body, link, read_at)
+  # Check if old columns exist
+  notif_cols = [row['name'] for row in c.execute("PRAGMA table_info(notifications)")]
+  if 'kind' not in notif_cols:
+    # Recreate notifications table with new schema
+    c.execute('''
+      CREATE TABLE IF NOT EXISTS notifications_new(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL REFERENCES users(id),
+        kind TEXT NOT NULL,
+        title TEXT NOT NULL,
+        body TEXT NOT NULL,
+        link TEXT,
+        created_at TEXT NOT NULL,
+        read_at TEXT
+      )
+    ''')
+    # Migrate existing data
+    c.execute('''
+      INSERT INTO notifications_new (user_id, kind, title, body, link, created_at, read_at)
+      SELECT user_id, 'info', 'Notification', message, NULL, created, NULL
+      FROM notifications
+    ''')
+    c.execute('DROP TABLE notifications')
+    c.execute('ALTER TABLE notifications_new RENAME TO notifications')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_notifications_read_at ON notifications(read_at)')
+
+  # Migration: Add audit columns to activity table (idempotent)
+  activity_cols = [row['name'] for row in c.execute("PRAGMA table_info(activity)")]
+  if 'actor_role' not in activity_cols:
+    c.execute('ALTER TABLE activity ADD COLUMN actor_role TEXT')
+  if 'target_type' not in activity_cols:
+    c.execute('ALTER TABLE activity ADD COLUMN target_type TEXT')
+  if 'target_id' not in activity_cols:
+    c.execute('ALTER TABLE activity ADD COLUMN target_id TEXT')
+  if 'from_status' not in activity_cols:
+    c.execute('ALTER TABLE activity ADD COLUMN from_status TEXT')
+  if 'to_status' not in activity_cols:
+    c.execute('ALTER TABLE activity ADD COLUMN to_status TEXT')
+  if 'reason' not in activity_cols:
+    c.execute('ALTER TABLE activity ADD COLUMN reason TEXT')
+
+  # Add BEFORE INSERT/UPDATE triggers to enforce valid verification_status values (SQLite)
+  # Since we can't add CHECK constraint to existing column, use triggers
+  c.execute('''
+    CREATE TRIGGER IF NOT EXISTS users_verification_status_check BEFORE INSERT ON users
+    BEGIN
+      SELECT CASE
+        WHEN NEW.verification_status NOT IN ('unverified','pending','verified','rejected')
+        THEN RAISE(ABORT, 'Invalid verification_status')
+      END;
+    END
+  ''')
+  c.execute('''
+    CREATE TRIGGER IF NOT EXISTS users_verification_status_check_update BEFORE UPDATE ON users
+    BEGIN
+      SELECT CASE
+        WHEN NEW.verification_status NOT IN ('unverified','pending','verified','rejected')
+        THEN RAISE(ABORT, 'Invalid verification_status')
+      END;
+    END
+  ''')
+  c.execute('''
+    CREATE TRIGGER IF NOT EXISTS resources_verification_status_check BEFORE INSERT ON resources
+    BEGIN
+      SELECT CASE
+        WHEN NEW.verification_status NOT IN ('unverified','pending','verified','rejected')
+        THEN RAISE(ABORT, 'Invalid verification_status')
+      END;
+    END
+  ''')
+  c.execute('''
+    CREATE TRIGGER IF NOT EXISTS resources_verification_status_check_update BEFORE UPDATE ON resources
+    BEGIN
+      SELECT CASE
+        WHEN NEW.verification_status NOT IN ('unverified','pending','verified','rejected')
+        THEN RAISE(ABORT, 'Invalid verification_status')
+      END;
+    END
+  ''')
+
   if seed and not c.execute('SELECT 1 FROM users LIMIT 1').fetchone():
    password=os.environ.get('CG_SEED_PASSWORD','')
    if len(password)<12: raise SystemExit('Set CG_SEED_PASSWORD to a unique password of at least 12 characters before --seed.')
    users=[('member','Aarav Mehta','member','Open Studio',1,['Workshop induction']),('newcomer','Mira Rao','member','Design Collective',0,[]),('owner','Ananya Shah','owner','Campus Makerspace',1,['Workshop induction','Laser safety']),('manager','Rohan Sen','manager','Campus Makerspace',1,['Workshop induction','Laser safety']),('admin','Campus Administrator','admin','Campus Services',1,[])]
-   for uid,name,role,group,verified,training in users: c.execute('INSERT INTO users VALUES(?,?,?,?,?,?,?,?)',(uid,name,uid+'@campus.example',password_hash(password),role,group,verified,json.dumps(training)))
+   for uid,name,role,group,verified,training in users: c.execute('INSERT INTO users VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(uid,name,uid+'@campus.example',password_hash(password),role,group,verified,json.dumps(training),'unverified',None,None,None,None,None))
    start,end=today(),(datetime.now(TZ).date()+timedelta(days=180)).isoformat()
    items=[('camera','Sony Alpha field kit','Photography','Media Lab · Block B','A mirrorless camera, two lenses, tripod and audio recorder for fieldwork and creative projects.','Collect from the equipment desk. Keep the kit dry. Return all labelled accessories.','Workshop induction'),('laser','Precision laser cutter','Fabrication','Fabrication Lab · Block A','A supervised 60W laser workstation for approved sheet materials and precise fabrication.','A qualified staff supervisor must be present. No PVC or unknown materials.','Laser safety'),('studio','Collaboration studio','Spaces','Innovation Centre · Level 1','A quiet, accessible room for eight with a whiteboard, display and adjustable desks.','Keep the accessible route clear. Leave the room ready for the next group.',''),('scope','Digital microscope','Research','Materials Lab · Block C','High-resolution inspection and image capture for non-hazardous material samples.','Non-biological samples only. Clean the stage and cover the unit after use.','Workshop induction')]
    for rid,name,cat,loc,desc,rules,training in items:
-    c.execute('INSERT INTO resources VALUES(?,?,?,?,?,?,?,?,?,?,?,1)',(rid,name,cat,loc,desc,rules,training,start,end,'owner','manager')); audit(c,'owner',rid,None,'Resource listed',name)
+    c.execute('INSERT INTO resources VALUES(?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?)',(rid,name,cat,loc,desc,rules,training,start,end,'owner','manager','unverified',None,None,None,None,None)); audit(c,'owner',rid,None,'Resource listed',name)
 def manages(u,r): return u['role']=='admin' or u['id'] in (r['owner_id'],r['manager_id'])
 def resource(c,rid):
  r=c.execute('SELECT * FROM resources WHERE id=?',(rid,)).fetchone()
@@ -215,9 +350,49 @@ class Handler(BaseHTTPRequestHandler):
      activity=c.execute("SELECT a.*,u.name actor,r.name resource_name FROM activity a JOIN users u ON u.id=a.actor_id LEFT JOIN resources r ON r.id=a.resource_id LEFT JOIN bookings b ON b.id=a.booking_id WHERE b.user_id=? OR r.owner_id=? OR r.manager_id=? OR ?='admin' ORDER BY a.id DESC LIMIT 200",(u['id'],u['id'],u['id'],u['role'])).fetchall()
      people=[public_user(x) for x in c.execute("SELECT * FROM users WHERE role='member' ORDER BY name")] if u['role']=='admin' else []
      return self.send_json({'user':public_user(u),'today':today(),'resources':resources,'bookings':[booking_view(c,b,u) for b in visible],'activity':[dict(x) for x in activity],'notifications':[dict(x) for x in c.execute('SELECT * FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT 50',(u['id'],))],'people':people})
+    if path=='/api/admin/verifications':
+     if u['role'] not in ('manager','admin'): fail('forbidden','role','Only managers and admins can view the verification queue.',403)
+     query=urlparse(self.path).query
+     params=dict(x.split('=') for x in query.split('&') if '=' in x) if query else {}
+     user_status=params.get('user_status'); resource_status=params.get('resource_status')
+     users_query='SELECT id,name,email,role,group_name,verification_status,verification_note,verification_reason,verification_requested_at,verified_by,verified_at FROM users WHERE 1=1'
+     users_params=[]
+     if user_status:
+      users_query+=' AND verification_status=?'
+      users_params.append(user_status)
+     else:
+      users_query+=" AND verification_status='pending'"
+     users_rows=[dict(x) for x in c.execute(users_query,users_params).fetchall()]
+     resources_query='SELECT r.id,r.name,r.category,r.location,r.verification_status,r.verification_note,r.verification_reason,r.verification_requested_at,r.verified_by,r.verified_at,u.name owner_name FROM resources r JOIN users u ON u.id=r.owner_id WHERE 1=1'
+     resources_params=[]
+     if resource_status:
+      resources_query+=' AND r.verification_status=?'
+      resources_params.append(resource_status)
+     else:
+      resources_query+=" AND r.verification_status='pending'"
+     resources_rows=[dict(x) for x in c.execute(resources_query,resources_params).fetchall()]
+     return self.send_json({'users':users_rows,'resources':resources_rows})
+    if path=='/api/verification/history':
+     query=urlparse(self.path).query
+     params=dict(x.split('=') for x in query.split('&') if '=' in x) if query else {}
+     target_type=params.get('target_type'); target_id=params.get('target_id')
+     if target_type not in ('user','resource') or not target_id: fail('invalid_field','target_type/target_id','Both target_type and target_id required.',422)
+     if target_type=='user':
+      person=c.execute('SELECT * FROM users WHERE id=?',(target_id,)).fetchone()
+      if not person: fail('not_found','user','User not found.',404)
+      if target_id != u['id'] and u['role'] not in ('manager','admin'): fail('forbidden','access','You can only view your own verification history.',403)
+     else:
+      r=c.execute('SELECT * FROM resources WHERE id=?',(target_id,)).fetchone()
+      if not r: fail('not_found','resource','Resource not found.',404)
+      if r['owner_id'] != u['id'] and u['role'] not in ('manager','admin'): fail('forbidden','access','You can only view your own resource verification history.',403)
+     rows=[dict(x) for x in c.execute('SELECT a.*,au.name actor_name FROM activity a JOIN users au ON au.id=a.actor_id WHERE a.target_type=? AND a.target_id=? ORDER BY a.id DESC',(target_type,target_id)).fetchall()]
+     return self.send_json({'history':rows})
     fail('not_found','request','API endpoint not found.',404)
   except Problem as e: self.send_json({'error':vars(e)},e.status)
   except Exception: logging.exception('Request failed'); self.send_json({'error':{'code':'server_error','message':'Could not load this request. Please retry.'}},500)
+ def do_PATCH(self):
+    # Reuse POST logic for PATCH
+    self.do_POST()
  def do_POST(self):
   try:
    expected=PUBLIC_ORIGIN or ('https://' if SECURE else 'http://')+self.headers.get('Host','')
@@ -245,6 +420,7 @@ class Handler(BaseHTTPRequestHandler):
      c.execute('UPDATE users SET password=? WHERE id=?',(password_hash(new),u['id'])); c.execute('DELETE FROM sessions WHERE user_id=?',(u['id'],)); audit(c,u['id'],None,None,'Password changed','All sessions revoked'); c.commit(); return self.send_json({'ok':True})
     if path=='/api/resources':
      if u['role'] not in ('owner','admin') or not u['verified']: fail('forbidden','role','Only verified owners can list resources.',403)
+     # Whitelist allowed fields
      name=text(body,'name',3,100); cat=text(body,'category',2,50); loc=text(body,'location',3,150); desc=text(body,'description',10,1000); rules=text(body,'rules',10,1000); training=text(body,'training',0,100)
      start,end=body.get('available_from'),body.get('available_to')
      for key,v in [('available_from',start),('available_to',end)]:
@@ -253,7 +429,46 @@ class Handler(BaseHTTPRequestHandler):
        date.fromisoformat(v)
       except ValueError: fail('invalid_date',key,'Choose a valid availability date.')
      if start<today() or end<=start: fail('invalid_range','available_to','Availability must begin today or later and end after it begins.')
-     rid=secrets.token_hex(8); c.execute('INSERT INTO resources VALUES(?,?,?,?,?,?,?,?,?,?,?,1)',(rid,name,cat,loc,desc,rules,training,start,end,u['id'],None)); audit(c,u['id'],rid,None,'Resource listed',name); c.commit(); return self.send_json({'id':rid},201)
+     rid=secrets.token_hex(8); c.execute('INSERT INTO resources VALUES(?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?)',(rid,name,cat,loc,desc,rules,training,start,end,u['id'],None,'unverified',None,None,None,None,None)); audit(c,u['id'],rid,None,'Resource listed',name); c.commit(); return self.send_json({'id':rid},201)
+    if re.fullmatch('/api/resources/[^/]+',path) and self.command=='PATCH':
+     if u['role'] not in ('owner','admin') or not u['verified']: fail('forbidden','role','Only verified owners can update resources.',403)
+     rid=path.split('/')[3]
+     r=resource(c,rid)
+     if r['owner_id'] != u['id'] and u['role']!='admin': fail('forbidden','resource','Only the resource owner or admin can update this resource.',403)
+     # Whitelist allowed fields - ignore verification_*, verified_*, role
+     allowed=['name','category','location','description','rules','training','available_from','available_to']
+     updates=[]; params=[]
+     for field in allowed:
+      if field in body:
+       if field in ('available_from','available_to'):
+        try:
+         v=body[field]
+         if not isinstance(v,str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}',v): raise ValueError()
+         date.fromisoformat(v)
+        except ValueError: fail('invalid_date',field,'Choose a valid availability date.')
+       if field=='training' and not isinstance(body[field],str): fail('invalid_field',field,'Training must be a string.')
+       updates.append(f'{field}=?')
+       params.append(body[field])
+     if not updates: fail('invalid_field','request','No valid fields to update.',422)
+     params.append(rid)
+     # Check if verified resource is being materially edited
+     material_fields={'name','category','location','description','rules','training','available_from','available_to'}
+     if r['verification_status']=='verified' and any(f in material_fields for f in body if f in material_fields):
+      updates.append('verification_status=?')
+      params.append('unverified')
+      updates.append('verification_note=?')
+      params.append('Reset due to material edit by owner')
+      updates.append('verified_by=?')
+      params.append(None)
+      updates.append('verified_at=?')
+      params.append(None)
+      updates.append('verification_reason=?')
+      params.append(None)
+      audit(c,u['id'],rid,None,'Verification reset',u['role'],'resource',rid,'verified','unverified','Material edit to verified resource')
+      create_notification(c,r['owner_id'],'verification_reset','Resource verification reset','Your resource verification was reset due to a material edit.')
+     c.execute(f'UPDATE resources SET {",".join(updates)} WHERE id=?',params)
+     audit(c,u['id'],rid,None,'Resource updated',u['role'],'resource',rid,None,None,','.join([f for f in body if f in allowed]))
+     c.commit(); return self.send_json({'ok':True})
     if path=='/api/bookings':
      start,end=dates(body); purpose=text(body,'purpose',10,1000); rid=text(body,'resource_id',1,80); key=self.headers.get('Idempotency-Key','')
      if not re.fullmatch(r'[A-Za-z0-9_-]{12,100}',key): fail('idempotency_required','request','A valid request key is required.',400)
@@ -275,9 +490,124 @@ class Handler(BaseHTTPRequestHandler):
      if u['role']!='admin': fail('forbidden','role','Only administrators may verify membership and training.',403)
      target=path.split('/')[3]; person=c.execute('SELECT * FROM users WHERE id=?',(target,)).fetchone()
      if not person: fail('not_found','user','User not found.',404)
+     if target == u['id']: fail('forbidden','self_verify','Cannot verify your own account.',403)
      reason=text(body,'reason',10,1000); verified=body.get('verified'); credentials=body.get('credentials')
      if not isinstance(verified,bool) or not isinstance(credentials,list) or len(credentials)>20 or any(not isinstance(x,str) or not 1<=len(x)<=100 for x in credentials): fail('invalid_field','credentials','Supply membership status and a list of training names.')
-     c.execute('UPDATE users SET verified=?,credentials=? WHERE id=?',(verified,json.dumps(list(dict.fromkeys(credentials))),target)); audit(c,u['id'],None,None,'Verification reviewed',person['name']+': '+reason+'; membership='+str(verified)+'; training='+', '.join(credentials)); notify(c,target,'Your verification has been reviewed. '+reason); c.commit(); return self.send_json({'ok':True})
+     from_status = 'unverified' if not person['verified'] else 'verified'
+     to_status = 'verified' if verified else 'unverified'
+     if from_status == to_status: fail('invalid_transition','status','No status change.',409)
+     c.execute('UPDATE users SET verified=?,credentials=?,verification_status=?,verification_reason=?,verified_by=?,verified_at=? WHERE id=?',(verified,json.dumps(list(dict.fromkeys(credentials))),to_status,reason,u['id'],now(),target))
+     audit(c,u['id'],None,None,'Verification reviewed',u['role'],'user',target,from_status,to_status,reason)
+     notify(c,target,f'Your verification has been reviewed. {reason}')
+     c.commit(); return self.send_json({'ok':True})
+    if path=='/api/verification/request':
+     if u['role'] not in ('member','owner','manager','admin'): fail('forbidden','role','Only authenticated users can request verification.',403)
+     target_type=body.get('target_type'); target_id=body.get('target_id'); note=body.get('note')
+     if target_type not in ('user','resource'): fail('invalid_field','target_type','target_type must be user or resource.',422)
+     if not target_id: fail('invalid_field','target_id','target_id is required.',422)
+     if target_type=='user':
+      if target_id != u['id']: fail('forbidden','target_id','Users can only request verification for themselves.',403)
+      person=c.execute('SELECT * FROM users WHERE id=?',(target_id,)).fetchone()
+      if not person: fail('not_found','user','User not found.',404)
+      if person['verification_status'] not in ('unverified','rejected'): fail('invalid_transition','verification_status','Only unverified or rejected users can request verification.',409)
+      c.execute('UPDATE users SET verification_status=?,verification_note=?,verification_requested_at=? WHERE id=?',('pending',note,now(),target_id))
+      audit(c,u['id'],None,None,'Verification requested',u['role'],'user',target_id,'unverified','pending',note or '')
+      for admin in c.execute("SELECT id FROM users WHERE role IN ('manager','admin') AND id!=?",(u['id'],)).fetchall():
+       create_notification(c,admin['id'],'verification_request',f'Verification requested: {person["name"]}',f'{person["name"]} requested ID verification.',f'/verification')
+     else:
+      r=c.execute('SELECT * FROM resources WHERE id=?',(target_id,)).fetchone()
+      if not r: fail('not_found','resource','Resource not found.',404)
+      if r['owner_id'] != u['id']: fail('forbidden','resource','Only the resource owner can request verification.',403)
+      if r['verification_status'] not in ('unverified','rejected'): fail('invalid_transition','verification_status','Only unverified or rejected resources can request verification.',409)
+      c.execute('UPDATE resources SET verification_status=?,verification_note=?,verification_requested_at=? WHERE id=?',('pending',note,now(),target_id))
+      audit(c,u['id'],target_id,None,'Verification requested',u['role'],'resource',target_id,'unverified','pending',note or '')
+      for admin in c.execute("SELECT id FROM users WHERE role IN ('manager','admin') AND id!=?",(u['id'],)).fetchall():
+       create_notification(c,admin['id'],'verification_request',f'Resource verification requested: {r["name"]}',f'{r["name"]} requested verification by {u["name"]}.',f'/verification')
+     c.commit(); return self.send_json({'ok':True})
+    if path=='/api/admin/verifications':
+     if u['role'] not in ('manager','admin'): fail('forbidden','role','Only managers and admins can view the verification queue.',403)
+     status_filter=urlparse(self.path).query
+     params=dict(x.split('=') for x in status_filter.split('&') if '=' in x) if status_filter else {}
+     user_status=params.get('user_status'); resource_status=params.get('resource_status')
+     users_query='SELECT id,name,email,role,group_name,verification_status,verification_note,verification_reason,verification_requested_at,verified_by,verified_at FROM users WHERE 1=1'
+     users_params=[]
+     if user_status:
+      users_query+=' AND verification_status=?'
+      users_params.append(user_status)
+     else:
+      users_query+=" AND verification_status='pending'"
+     users_rows=[dict(x) for x in c.execute(users_query,users_params).fetchall()]
+     resources_query='SELECT r.id,r.name,r.category,r.location,r.verification_status,r.verification_note,r.verification_reason,r.verification_requested_at,r.verified_by,r.verified_at,u.name owner_name FROM resources r JOIN users u ON u.id=r.owner_id WHERE 1=1'
+     resources_params=[]
+     if resource_status:
+      resources_query+=' AND r.verification_status=?'
+      resources_params.append(resource_status)
+     else:
+      resources_query+=" AND r.verification_status='pending'"
+     resources_rows=[dict(x) for x in c.execute(resources_query,resources_params).fetchall()]
+     return self.send_json({'users':users_rows,'resources':resources_rows})
+    if path=='/api/admin/verify' and self.command=='PATCH':
+     if u['role'] not in ('manager','admin'): fail('forbidden','role','Only managers and admins can verify.',403)
+     target_type=body.get('target_type'); target_id=body.get('target_id'); decision=body.get('decision'); reason=body.get('reason')
+     if target_type not in ('user','resource'): fail('invalid_field','target_type','target_type must be user or resource.',422)
+     if not target_id: fail('invalid_field','target_id','target_id is required.',422)
+     if decision not in ('approve','reject'): fail('invalid_field','decision','decision must be approve or reject.',422)
+     if decision=='reject' and (not reason or len(reason.strip())<3): fail('invalid_field','reason','Reason required when rejecting (minimum 3 characters).',422)
+     if target_type=='user':
+      person=c.execute('SELECT * FROM users WHERE id=?',(target_id,)).fetchone()
+      if not person: fail('not_found','user','User not found.',404)
+      if target_id == u['id']: fail('forbidden','self_verify','Cannot verify your own account.',403)
+      if person['verification_status']!='pending': fail('invalid_transition','verification_status','Only pending users can be approved or rejected.',409)
+      from_status=person['verification_status']
+      to_status='verified' if decision=='approve' else 'rejected'
+      rc=c.execute('UPDATE users SET verification_status=?,verification_reason=?,verified_by=?,verified_at=? WHERE id=? AND verification_status=?',(to_status,reason,u['id'],now(),target_id,from_status)).rowcount
+      if not rc: fail('conflict','verification_status','Status changed concurrently. Refresh and try again.',409)
+      audit(c,u['id'],None,None,'Verification '+decision.capitalize(),u['role'],'user',target_id,from_status,to_status,reason or '')
+      create_notification(c,target_id,'verification_'+decision,f'Verification {decision}d',f'Your ID verification was {decision}d. {reason or ""}')
+     else:
+      r=c.execute('SELECT * FROM resources WHERE id=?',(target_id,)).fetchone()
+      if not r: fail('not_found','resource','Resource not found.',404)
+      if r['owner_id'] == u['id']: fail('forbidden','self_verify','Cannot verify your own resource. Requires another manager/admin.',403)
+      if r['verification_status']!='pending': fail('invalid_transition','verification_status','Only pending resources can be approved or rejected.',409)
+      from_status=r['verification_status']
+      to_status='verified' if decision=='approve' else 'rejected'
+      rc=c.execute('UPDATE resources SET verification_status=?,verification_reason=?,verified_by=?,verified_at=? WHERE id=? AND verification_status=?',(to_status,reason,u['id'],now(),target_id,from_status)).rowcount
+      if not rc: fail('conflict','verification_status','Status changed concurrently. Refresh and try again.',409)
+      audit(c,u['id'],target_id,None,'Verification '+decision.capitalize(),u['role'],'resource',target_id,from_status,to_status,reason or '')
+      create_notification(c,r['owner_id'],'verification_'+decision,f'Resource verification {decision}d',f'Your resource "{r["name"]}" verification was {decision}d. {reason or ""}')
+     c.commit(); return self.send_json({'ok':True})
+    if path=='/api/verification/history':
+     target_type=urlparse(self.path).query
+     params=dict(x.split('=') for x in target_type.split('&') if '=' in x) if target_type else {}
+     target_type=params.get('target_type'); target_id=params.get('target_id')
+     if target_type not in ('user','resource') or not target_id: fail('invalid_field','target_type/target_id','Both target_type and target_id required.',422)
+     if target_type=='user':
+      person=c.execute('SELECT * FROM users WHERE id=?',(target_id,)).fetchone()
+      if not person: fail('not_found','user','User not found.',404)
+      if target_id != u['id'] and u['role'] not in ('manager','admin'): fail('forbidden','access','You can only view your own verification history.',403)
+     else:
+      r=c.execute('SELECT * FROM resources WHERE id=?',(target_id,)).fetchone()
+      if not r: fail('not_found','resource','Resource not found.',404)
+      if r['owner_id'] != u['id'] and u['role'] not in ('manager','admin'): fail('forbidden','access','You can only view your own resource verification history.',403)
+     rows=[dict(x) for x in c.execute('SELECT a.*,au.name actor_name FROM activity a JOIN users au ON au.id=a.actor_id WHERE a.target_type=? AND a.target_id=? ORDER BY a.id DESC',(target_type,target_id)).fetchall()]
+     return self.send_json({'history':rows})
+    if path=='/api/notifications':
+     if self.command=='GET':
+      limit=int(urlparse(self.path).query.split('=')[1]) if 'limit=' in urlparse(self.path).query else 50
+      rows=[dict(x) for x in c.execute('SELECT * FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT ?',(u['id'],limit)).fetchall()]
+      unread=c.execute('SELECT COUNT(*) FROM notifications WHERE user_id=? AND read_at IS NULL',(u['id'],)).fetchone()[0]
+      return self.send_json({'notifications':rows,'unread_count':unread})
+     fail('method_not_allowed','method','Use GET.',405)
+    if path=='/api/notifications/read':
+     if self.command!='POST': fail('method_not_allowed','method','Use POST.',405)
+     ids=body.get('ids'); all_flag=body.get('all')
+     if all_flag:
+      c.execute('UPDATE notifications SET read_at=? WHERE user_id=? AND read_at IS NULL',(now(),u['id']))
+     elif ids and isinstance(ids,list):
+      placeholders=','.join('?'*len(ids))
+      c.execute(f'UPDATE notifications SET read_at=? WHERE user_id=? AND id IN ({placeholders})',(now(),u['id'],)+tuple(ids))
+     else: fail('invalid_field','ids','Provide ids array or all=true.',422)
+     c.commit(); return self.send_json({'ok':True})
     if re.fullmatch('/api/bookings/[^/]+/action',path):
      bid=path.split('/')[3]; b=c.execute('SELECT * FROM bookings WHERE id=?',(bid,)).fetchone()
      if not b: fail('not_found','booking','Booking not found.',404)
