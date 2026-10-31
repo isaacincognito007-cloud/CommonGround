@@ -1,0 +1,15 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "api/index.py": {
+      "includeFiles": "web/**"
+    }
+  },
+  "rewrites": [
+    { "source": "/api/:path*", "destination": "/api?__cg_path=/api/:path*" },
+    { "source": "/", "destination": "/api?__cg_path=/" },
+    { "source": "/app.js", "destination": "/api?__cg_path=/app.js" },
+    { "source": "/style.css", "destination": "/api?__cg_path=/style.css" },
+    { "source": "/favicon.svg", "destination": "/api?__cg_path=/favicon.svg" }
+  ]
+}

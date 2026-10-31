@@ -1,0 +1,4 @@
+# Required by the Vercel PostgreSQL adapter; local SQLite needs no database package.
+psycopg[binary]==3.3.6
+
+# The optional browser runner also requires a local Chromium executable.

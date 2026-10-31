@@ -1,0 +1,13 @@
+.git
+.env
+.env.*
+!.env.example
+__pycache__
+*.pyc
+data
+*.sqlite3*
+output
+screenshots
+test-results
+cg-test-*
+cg-browser-*

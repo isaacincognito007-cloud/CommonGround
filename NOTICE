@@ -1,0 +1,38 @@
+# Third-party notices
+Owner: Isaac Shiloah Herbert V, ISAAC.INCOGNITO007  
+Contact: isaac.incognito007@gmail.com
+
+## Application source
+
+The Python service, database schema/queries, browser interface, CSS illustrations, documentation and test utilities in this project are original project work and are offered under `LICENSE` (MIT). The project does not bundle third-party application code, templates, icons, photographs, or font files. The browser uses locally installed Trebuchet MS/Segoe UI with a generic sans-serif fallback.
+
+No source code from researched products was copied, translated, modified or redistributed. Generic product patterns (resource search, booking, staff decisions, quotas, check-in/out, and histories) were implemented independently. The Snipe-IT repository was checked for licensing only; its AGPL-3.0 source is not reused.
+
+AI-assisted development and design: significant coding, research synthesis and visual-design assistance was provided by SuperApp. The running application does not call an AI model or AI provider. In Vercel mode it connects to the operator's managed PostgreSQL database; no other third-party APIs are called at runtime.
+
+## Runtime and optional deployment software
+
+These components are supplied by the chosen Python distribution, installed operator software or container images; they are not vendored in this source project. Their respective distribution notices apply.
+
+| Component | Use | License / notice |
+|---|---|---|
+| CPython standard library | HTTP server, SQLite bindings, password hashing, JSON, date handling and tests | Python Software Foundation License and associated distribution notices. https://www.python.org/ · https://docs.python.org/3/license.html |
+| Psycopg 3.3.6 (`psycopg[binary]`) | PostgreSQL DB-API driver used by the Vercel deployment; installed from PyPI, not vendored in this repository | GNU Lesser General Public License v3 with additional permissions in the upstream license. https://github.com/psycopg/psycopg/blob/3.3.6/LICENSE.txt |
+| SQLite | Embedded relational database engine | Public domain. https://www.sqlite.org/copyright.html |
+| OpenSSL (via selected Python build) | `hashlib.scrypt` password hashing | License depends on distribution/version; OpenSSL 3 uses Apache License 2.0. Not separately redistributed. https://www.openssl.org/ |
+| Chromium (optional) | Real-browser UI regression runner; installed separately by operator | Chromium and its dependencies have separate notices. No Chromium binary is bundled. https://www.chromium.org/ |
+| Caddy (optional container) | TLS-terminating reverse proxy defined in `compose.yaml` | Caddy source is Apache-2.0; image dependencies have their own licenses. The project supplies configuration only. https://github.com/caddyserver/caddy |
+| Docker and Compose | Build/runtime tooling | Installed separately. Consult the exact distribution and version's notices. No Docker binary is bundled. https://www.docker.com/ |
+
+The Python and Caddy base images may include additional operating-system packages. Preserve and review their notices before redistributing built images; pin audited image digests for a managed deployment.
+
+## Research references — no reuse
+
+- Skedda: https://www.skedda.com/
+- Snipe-IT marketing site: https://snipeitapp.com/
+- Snipe-IT source/license: https://github.com/snipe/snipe-it (AGPL-3.0)
+- SuperSaaS: https://www.supersaas.com/
+- LibCal: https://www.springshare.com/libcal/
+- Cal.com: https://cal.com/
+
+These are product references, not software dependencies. Their names, logos and product material are owned by their respective holders. Features, prices, service terms and licensing may change. `docs/PRODUCT-AND-RESEARCH.md` distinguishes observed page content from product-gap hypotheses.

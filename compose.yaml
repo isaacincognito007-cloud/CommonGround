@@ -1,0 +1,39 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      CG_DB: /data/commonground.sqlite3
+      CG_HOST: 0.0.0.0
+      PORT: 8000
+      CG_ORIGIN: ${CG_ORIGIN:?Set CG_ORIGIN to the exact HTTPS application origin}
+      CG_SECURE_COOKIE: "1"
+    volumes:
+      - ground-data:/data
+    expose:
+      - "8000"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+  proxy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      CG_DOMAIN: ${CG_DOMAIN:?Set CG_DOMAIN to your DNS hostname}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - app
+volumes:
+  ground-data:
+  caddy-data:
+  caddy-config:
