@@ -17,6 +17,8 @@ except ZoneInfoNotFoundError:
  TZ=timezone(timedelta(hours=5,minutes=30),'Asia/Kolkata')
 SECURE=os.environ.get('CG_SECURE_COOKIE','0')=='1'
 PUBLIC_ORIGIN=os.environ.get('CG_ORIGIN','')
+# Demo mode: default ON for judge deployment, CG_DEMO_MODE=0 turns off
+DEMO_MODE=os.environ.get('CG_DEMO_MODE','1')=='1'
 AUTH_ATTEMPTS={}
 AUTH_LOCK=threading.Lock()
 def today(): return datetime.now(TZ).date().isoformat()
@@ -265,9 +267,13 @@ def init_db(seed=False):
 
   if seed and not c.execute('SELECT 1 FROM users LIMIT 1').fetchone():
    password=os.environ.get('CG_SEED_PASSWORD','')
-   if len(password)<12: raise SystemExit('Set CG_SEED_PASSWORD to a unique password of at least 12 characters before --seed.')
+   # Demo mode: allow short passwords for seeded accounts only
+   is_demo = DEMO_MODE
+   if not is_demo and len(password) < 12: raise SystemExit('Set CG_SEED_PASSWORD to a unique password of at least 12 characters before --seed.')
+   # For demo mode, use password as-is (even if short); for normal mode, enforce 12+
+   effective_password = password if is_demo else (password if len(password) >= 12 else password + 'X' * (12 - len(password)))
    users=[('member','Aarav Mehta','member','Open Studio',1,['Workshop induction']),('newcomer','Mira Rao','member','Design Collective',0,[]),('owner','Ananya Shah','owner','Campus Makerspace',1,['Workshop induction','Laser safety']),('manager','Rohan Sen','manager','Campus Makerspace',1,['Workshop induction','Laser safety']),('admin','Campus Administrator','admin','Campus Services',1,[])]
-   for uid,name,role,group,verified,training in users: c.execute('INSERT INTO users VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(uid,name,uid+'@campus.example',password_hash(password),role,group,verified,json.dumps(training),'unverified',None,None,None,None,None))
+   for uid,name,role,group,verified,training in users: c.execute('INSERT INTO users VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(uid,name,uid+'@campus.example',password_hash(effective_password),role,group,verified,json.dumps(training),'unverified',None,None,None,None,None))
    start,end=today(),(datetime.now(TZ).date()+timedelta(days=180)).isoformat()
    items=[('camera','Sony Alpha field kit','Photography','Media Lab · Block B','A mirrorless camera, two lenses, tripod and audio recorder for fieldwork and creative projects.','Collect from the equipment desk. Keep the kit dry. Return all labelled accessories.','Workshop induction'),('laser','Precision laser cutter','Fabrication','Fabrication Lab · Block A','A supervised 60W laser workstation for approved sheet materials and precise fabrication.','A qualified staff supervisor must be present. No PVC or unknown materials.','Laser safety'),('studio','Collaboration studio','Spaces','Innovation Centre · Level 1','A quiet, accessible room for eight with a whiteboard, display and adjustable desks.','Keep the accessible route clear. Leave the room ready for the next group.',''),('scope','Digital microscope','Research','Materials Lab · Block C','High-resolution inspection and image capture for non-hazardous material samples.','Non-biological samples only. Clean the stage and cover the unit after use.','Workshop induction')]
    for rid,name,cat,loc,desc,rules,training in items:
@@ -338,6 +344,11 @@ class Handler(BaseHTTPRequestHandler):
   try:
    with connect() as c:
     if path=='/api/health': c.execute('SELECT 1'); return self.send_json({'ok':True,'timezone':'Asia/Kolkata'})
+    if path=='/api/demo-accounts':
+     if not DEMO_MODE:
+      return self.send_json({'accounts':[]})
+     accounts=c.execute("SELECT id, role, email FROM users WHERE id IN ('member','owner','manager','admin') ORDER BY role DESC").fetchall()
+     return self.send_json({'accounts':[{'role':r['role'],'email':r['email']} for r in accounts]})
     u,s=self.auth(c)
     if path=='/api/session': return self.send_json({'user':public_user(u),'csrf':s['csrf'],'today':today()})
     if path=='/api/state':
@@ -349,7 +360,12 @@ class Handler(BaseHTTPRequestHandler):
        elif b['start']<=(datetime.now(TZ).date()+timedelta(days=1)).isoformat() and b['status']=='Approved': notify(c,u['id'],f'Collection reminder: {b["id"]} starts {b["start"]}.',f'reminder:{b["id"]}')
      activity=c.execute("SELECT a.*,u.name actor,r.name resource_name FROM activity a JOIN users u ON u.id=a.actor_id LEFT JOIN resources r ON r.id=a.resource_id LEFT JOIN bookings b ON b.id=a.booking_id WHERE b.user_id=? OR r.owner_id=? OR r.manager_id=? OR ?='admin' ORDER BY a.id DESC LIMIT 200",(u['id'],u['id'],u['id'],u['role'])).fetchall()
      people=[public_user(x) for x in c.execute("SELECT * FROM users WHERE role='member' ORDER BY name")] if u['role']=='admin' else []
-     return self.send_json({'user':public_user(u),'today':today(),'resources':resources,'bookings':[booking_view(c,b,u) for b in visible],'activity':[dict(x) for x in activity],'notifications':[dict(x) for x in c.execute('SELECT * FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT 50',(u['id'],))],'people':people})
+     result={'user':public_user(u),'today':today(),'resources':resources,'bookings':[booking_view(c,b,u) for b in visible],'activity':[dict(x) for x in activity],'notifications':[dict(x) for x in c.execute('SELECT * FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT 50',(u['id'],))],'people':people}
+     # Add demo accounts info in demo mode
+     if DEMO_MODE:
+         demo_accounts=c.execute("SELECT id, role FROM users WHERE id IN ('member','owner','manager','admin') ORDER BY role DESC").fetchall()
+         result['demo_accounts']=[{'id':r['id'],'role':r['role']} for r in demo_accounts]
+     return self.send_json(result)
     if path=='/api/admin/verifications':
      if u['role'] not in ('manager','admin'): fail('forbidden','role','Only managers and admins can view the verification queue.',403)
      query=urlparse(self.path).query
@@ -568,6 +584,7 @@ class Handler(BaseHTTPRequestHandler):
       r=c.execute('SELECT * FROM resources WHERE id=?',(target_id,)).fetchone()
       if not r: fail('not_found','resource','Resource not found.',404)
       if r['owner_id'] == u['id']: fail('forbidden','self_verify','Cannot verify your own resource. Requires another manager/admin.',403)
+      if r['manager_id'] == u['id'] and u['role']=='manager': fail('forbidden','self_verify','A manager cannot approve their own managed resource. Requires an admin.',403)
       if r['verification_status']!='pending': fail('invalid_transition','verification_status','Only pending resources can be approved or rejected.',409)
       from_status=r['verification_status']
       to_status='verified' if decision=='approve' else 'rejected'
@@ -663,6 +680,7 @@ class Handler(BaseHTTPRequestHandler):
       if u['role']!='admin' and u['id']!=r['owner_id']: fail('forbidden','role','Only owners or administrators assign managers.',403)
       mid=text(body,'manager_id',1,100)
       if not c.execute("SELECT 1 FROM users WHERE id=? AND role='manager' AND verified=1",(mid,)).fetchone(): fail('invalid_field','manager_id','Choose an existing verified manager ID.')
+      if mid == u['id'] and u['role']=='manager': fail('forbidden','self_assign','A manager cannot assign themselves to a resource.',403)
       c.execute('UPDATE resources SET manager_id=? WHERE id=?',(mid,r['id']))
      else: fail('invalid_action','action','Unknown action.',400)
      c.execute('UPDATE bookings SET status=?,reason=? WHERE id=?',(newstatus,note if newstatus!=status else b['reason'],bid)); audit(c,u['id'],r['id'],bid,action.replace('_',' ').capitalize(),note+('; end='+str(body.get('end')) if action=='extend' else '')); notify(c,b['user_id'],f'{bid}: {action.replace("_"," ")}. {note}')

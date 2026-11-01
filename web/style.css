@@ -9,3 +9,21 @@
 .vb-badge.unverified,.vb-badge.rejected{background:#f7f7f7;color:#666;border:1px solid #d0d0d0;}
 .vb-icon{font-size:12px;}
 .vb-text{line-height:1.2;}
+/* Demo accounts panel */
+.demo-accounts{margin-top:20px;padding:16px;background:var(--white);border:1px solid var(--line);border-radius:8px}
+.demo-accounts h3{margin:0 0 8px;font-size:14px;font-weight:600;color:var(--ink)}
+.demo-accounts p.small{margin:0 0 12px;font-size:12px;color:var(--muted)}
+.demo-account{display:flex;align-items:center;gap:12px;padding:10px;background:var(--paper);border:1px solid var(--line);border-radius:6px;margin-bottom:8px;flex-wrap:wrap}
+.demo-role{font-weight:600;color:var(--forest);font-size:13px;text-transform:capitalize;min-width:80px}
+.demo-id{font-family:monospace;font-size:12px;color:var(--muted);flex:1;min-width:140px;word-break:break-all}
+.demo-use{border:1px solid var(--forest);background:var(--white);color:var(--forest);border-radius:6px;padding:6px 12px;font-size:12px;font-weight:600;white-space:nowrap;min-height:40px;touch-action:manipulation;cursor:pointer}
+.demo-use:hover{background:var(--leaf)}
+.demo-use:focus-visible{outline:3px solid #a05219;outline-offset:2px}
+
+/* Password field with toggle */
+.password-wrap{position:relative}
+.password-wrap input{padding-right:52px}
+.password-toggle{position:absolute;right:8px;top:50%;transform:translateY(-50%);width:40px;height:40px;display:flex;align-items:center;justify-content:center;background:transparent;border:none;color:var(--muted);cursor:pointer;padding:0;border-radius:4px;touch-action:manipulation}
+.password-toggle:hover{color:var(--forest);background:var(--leaf)}
+.password-toggle:focus-visible{outline:3px solid #a05219;outline-offset:2px}
+.password-toggle svg{width:20px;height:20px}

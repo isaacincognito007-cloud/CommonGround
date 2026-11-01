@@ -8,14 +8,14 @@ PASSWORD=secrets.token_urlsafe(22)
 class Client:
  def __init__(self,base):
   self.base=base; self.csrf=''; self.jar=http.cookiejar.CookieJar(); self.opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.jar))
- def request(self,path,body=None,key=None,csrf=True,origin=None):
+ def request(self,path,body=None,key=None,csrf=True,origin=None,method=None):
   if os.environ.get('CG_TEST_TRANSPORT')=='socketpair':
    from transport import request
    return request(self,path,body,key,csrf,origin)
   headers={'Origin':origin or self.base}
   if body is not None: headers['Content-Type']='application/json'; headers['X-CSRF-Token']=self.csrf if csrf else ''
   if key: headers['Idempotency-Key']=key
-  req=urllib.request.Request(self.base+'/api'+path, data=json.dumps(body).encode() if body is not None else None,headers=headers)
+  req=urllib.request.Request(self.base+'/api'+path, data=json.dumps(body).encode() if body is not None else None,headers=headers, method=method)
   try:
    with self.opener.open(req,timeout=15) as response: return response.status,json.load(response)
   except urllib.error.HTTPError as error: return error.code,json.load(error)
@@ -128,3 +128,163 @@ class ServiceTests(unittest.TestCase):
   self.assertEqual(self.action(first,'cancel',self.member)[0],200)
   self.assertEqual(self.action(second,'approve')[1]['booking']['status'],'Approved')
  if __name__=='__main__':unittest.main(verbosity=2)
+
+class VerificationWorkflowTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        server.Handler.log_message=lambda *a:None
+        cls.http=server.ThreadingHTTPServer(('127.0.0.1',0),server.Handler)
+        cls.base='http://127.0.0.1:'+str(cls.http.server_port)
+        cls.thread=threading.Thread(target=cls.http.serve_forever,daemon=True);cls.thread.start()
+    @classmethod
+    def tearDownClass(cls):
+        cls.http.shutdown();cls.http.server_close()
+    def setUp(self):
+        self.folder=tempfile.TemporaryDirectory(prefix='cg-test-',dir='.')
+        server.DB=str(Path(self.folder.name)/'test.sqlite3');server.AUTH_ATTEMPTS.clear();os.environ['CG_SEED_PASSWORD']=PASSWORD;server.init_db(True)
+        self.member=Client(self.base);self.member.login();self.owner=Client(self.base);self.owner.login('owner');self.admin=Client(self.base);self.admin.login('admin');self.manager=Client(self.base);self.manager.login('manager');self.new=Client(self.base);self.new.login('newcomer')
+        self.day=date.fromisoformat(server.today())
+    def tearDown(self):
+        import gc
+        gc.collect()
+        try:
+            self.folder.cleanup()
+        except Exception:
+            pass
+    def test_verification_request_user(self):
+        code,res=self.member.request('/verification/request',{'target_type':'user','target_id':'member','note':'verify me'})
+        self.assertEqual(code,200)
+        code,res=self.member.request('/verification/request',{'target_type':'user','target_id':'member'})
+        self.assertEqual(code,409)  # already pending
+    def test_verification_request_user_other(self):
+        code,res=self.member.request('/verification/request',{'target_type':'user','target_id':'newcomer'})
+        self.assertEqual(code,403)  # can only request for self
+    def test_verification_request_resource(self):
+        code,res=self.owner.request('/verification/request',{'target_type':'resource','target_id':'camera','note':'verify camera'})
+        self.assertEqual(code,200)
+        code,res=self.member.request('/verification/request',{'target_type':'resource','target_id':'camera'})
+        self.assertEqual(code,403)  # not owner
+    def test_verification_request_resource_already_verified(self):
+        code,res=self.admin.request('/verification/request',{'target_type':'resource','target_id':'camera'})
+        self.assertEqual(code,200)
+        # Approve it
+        code,res=self.admin.request('/admin/verify',{'target_type':'resource','target_id':'camera','decision':'approve','reason':'OK'},csrf=True,origin=self.base,method='PATCH')
+        self.assertEqual(code,200)
+        code,res=self.owner.request('/verification/request',{'target_type':'resource','target_id':'camera'})
+        self.assertEqual(code,409)  # already verified
+    def test_admin_verifications_queue(self):
+        self.member.request('/verification/request',{'target_type':'user','target_id':'member','note':'verify me'})
+        self.owner.request('/verification/request',{'target_type':'resource','target_id':'camera','note':'verify camera'})
+        code,res=self.admin.request('/admin/verifications')
+        self.assertEqual(code,200)
+        self.assertEqual(len(res['users']),1)
+        self.assertEqual(len(res['resources']),1)
+        code,res=self.member.request('/admin/verifications')
+        self.assertEqual(code,403)  # member cannot view
+    def test_admin_verify_approve_user(self):
+        self.member.request('/verification/request',{'target_type':'user','target_id':'member'})
+        code,res=self.admin.request('/admin/verify',{'target_type':'user','target_id':'member','decision':'approve','reason':'verified ok'},method='PATCH')
+        self.assertEqual(code,200)
+        # Verify status changed
+        with server.connect() as c:
+            row=c.execute('SELECT verification_status FROM users WHERE id="member"').fetchone()
+            self.assertEqual(row['verification_status'],'verified')
+    def test_admin_verify_reject_user(self):
+        self.member.request('/verification/request',{'target_type':'user','target_id':'member'})
+        code,res=self.admin.request('/admin/verify',{'target_type':'user','target_id':'member','decision':'reject','reason':'missing docs'},method='PATCH')
+        self.assertEqual(code,200)
+        with server.connect() as c:
+            row=c.execute('SELECT verification_status FROM users WHERE id="member"').fetchone()
+            self.assertEqual(row['verification_status'],'rejected')
+    def test_admin_verify_reject_no_reason(self):
+        self.member.request('/verification/request',{'target_type':'user','target_id':'member'})
+        code,res=self.admin.request('/admin/verify',{'target_type':'user','target_id':'member','decision':'reject','reason':''},method='PATCH')
+        self.assertEqual(code,422)
+        self.assertEqual(res['error']['code'],'invalid_field')
+    def test_admin_verify_self_user(self):
+        code,res=self.admin.request('/admin/verify',{'target_type':'user','target_id':'admin','decision':'approve','reason':'self'},method='PATCH')
+        self.assertEqual(code,403)
+        self.assertEqual(res['error']['code'],'self_verify')
+    def test_admin_verify_own_resource(self):
+        # owner requests, admin (who is also owner) tries to approve
+        body={'name':'Test resource','category':'Test','location':'Test','description':'Test resource for self verify','rules':'Test rules','training':'','available_from':self.day.isoformat(),'available_to':(self.day+timedelta(days=30)).isoformat()}
+        code,res=self.owner.request('/resources',body)
+        self.assertEqual(code,201)
+        rid=res['id']
+        self.owner.request('/verification/request',{'target_type':'resource','target_id':rid})
+        code,res=self.owner.request('/admin/verify',{'target_type':'resource','target_id':rid,'decision':'approve','reason':'self'},method='PATCH')
+        self.assertEqual(code,403)
+        self.assertEqual(res['error']['code'],'self_verify')
+    def test_manager_verify_own_managed_resource(self):
+        # Create resource, assign manager
+        body={'name':'Managed resource','category':'Test','location':'Test','description':'Test','rules':'Test','training':'','available_from':self.day.isoformat(),'available_to':(self.day+timedelta(days=30)).isoformat()}
+        code,res=self.owner.request('/resources',body)
+        self.assertEqual(code,201)
+        rid=res['id']
+        self.owner.request('/bookings/'+rid+'/action',{'action':'assign_manager','manager_id':'manager'})
+        self.owner.request('/verification/request',{'target_type':'resource','target_id':rid})
+        code,res=self.manager.request('/admin/verify',{'target_type':'resource','target_id':rid,'decision':'approve','reason':'self'},method='PATCH')
+        self.assertEqual(code,403)
+        self.assertEqual(res['error']['code'],'self_verify')
+    def test_verification_history(self):
+        self.member.request('/verification/request',{'target_type':'user','target_id':'member'})
+        self.admin.request('/admin/verify',{'target_type':'user','target_id':'member','decision':'approve','reason':'OK'},method='PATCH')
+        code,res=self.member.request('/verification/history?target_type=user&target_id=member')
+        self.assertEqual(code,200)
+        self.assertEqual(len(res['history']),2)  # request + approve
+        code,res=self.new.request('/verification/history?target_type=user&target_id=member')
+        self.assertEqual(code,403)  # other user cannot view
+    def test_notifications(self):
+        self.member.request('/verification/request',{'target_type':'user','target_id':'member'})
+        code,res=self.member.request('/notifications')
+        self.assertEqual(code,200)
+        self.assertEqual(res['unread_count'],1)
+        # Mark as read
+        code,res=self.member.request('/notifications/read',{'all':True},method='POST')
+        self.assertEqual(code,200)
+        code,res=self.member.request('/notifications')
+        self.assertEqual(res['unread_count'],0)
+    def test_notifications_own_only(self):
+        # Admin creates notification for member by approving
+        self.member.request('/verification/request',{'target_type':'user','target_id':'member'})
+        self.admin.request('/admin/verify',{'target_type':'user','target_id':'member','decision':'approve','reason':'OK'},method='PATCH')
+        code,res=self.member.request('/notifications')
+        self.assertEqual(code,200)
+        self.assertEqual(res['unread_count'],1)
+        # Admin cannot read member's notifications
+        code,res=self.admin.request('/notifications')
+        self.assertEqual(code,200)
+        self.assertEqual(res['unread_count'],0)  # admin has own, not member's
+    def test_patch_resource_mass_assignment(self):
+        body={'name':'Test resource','category':'Test','location':'Test','description':'Test','rules':'Test','training':'','available_from':self.day.isoformat(),'available_to':(self.day+timedelta(days=30)).isoformat()}
+        code,res=self.owner.request('/resources',body)
+        self.assertEqual(code,201)
+        rid=res['id']
+        # Try to inject forbidden fields
+        code,res=self.owner.request('/resources/'+rid,{'verification_status':'verified','role':'admin'},method='PATCH')
+        self.assertEqual(code,200)
+        with server.connect() as c:
+            row=c.execute('SELECT verification_status FROM resources WHERE id=?',(rid,)).fetchone()
+            self.assertEqual(row['verification_status'],'unverified')  # unchanged
+    def test_patch_verified_resource_resets(self):
+        body={'name':'Test resource','category':'Test','location':'Test','description':'Test','rules':'Test','training':'','available_from':self.day.isoformat(),'available_to':(self.day+timedelta(days=30)).isoformat()}
+        code,res=self.owner.request('/resources',body)
+        self.assertEqual(code,201)
+        rid=res['id']
+        # Approve it
+        self.owner.request('/verification/request',{'target_type':'resource','target_id':rid})
+        self.admin.request('/admin/verify',{'target_type':'resource','target_id':rid,'decision':'approve','reason':'OK'},method='PATCH')
+        # Now patch it
+        code,res=self.owner.request('/resources/'+rid,{'name':'New name'},method='PATCH')
+        self.assertEqual(code,200)
+        with server.connect() as c:
+            row=c.execute('SELECT verification_status FROM resources WHERE id=?',(rid,)).fetchone()
+            self.assertEqual(row['verification_status'],'unverified')  # reset
+    def test_assign_manager_self_assign(self):
+        body={'name':'Test resource','category':'Test','location':'Test','description':'Test','rules':'Test','training':'','available_from':self.day.isoformat(),'available_to':(self.day+timedelta(days=30)).isoformat()}
+        code,res=self.owner.request('/resources',body)
+        self.assertEqual(code,201)
+        rid=res['id']
+        code,res=self.manager.request('/bookings/'+rid+'/action',{'action':'assign_manager','manager_id':'manager'})
+        self.assertEqual(code,403)
+        self.assertEqual(res['error']['code'],'self_assign')
