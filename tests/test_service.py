@@ -4,6 +4,7 @@ from datetime import date, timedelta
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import server
+DEMO_PASSWORD='common'
 PASSWORD=secrets.token_urlsafe(22)
 class Client:
  def __init__(self,base):
@@ -141,8 +142,8 @@ class VerificationWorkflowTests(unittest.TestCase):
         cls.http.shutdown();cls.http.server_close()
     def setUp(self):
         self.folder=tempfile.TemporaryDirectory(prefix='cg-test-',dir='.')
-        server.DB=str(Path(self.folder.name)/'test.sqlite3');server.AUTH_ATTEMPTS.clear();os.environ['CG_SEED_PASSWORD']=PASSWORD;server.init_db(True)
-        self.member=Client(self.base);self.member.login();self.owner=Client(self.base);self.owner.login('owner');self.admin=Client(self.base);self.admin.login('admin');self.manager=Client(self.base);self.manager.login('manager');self.new=Client(self.base);self.new.login('newcomer')
+        server.DB=str(Path(self.folder.name)/'test.sqlite3');server.AUTH_ATTEMPTS.clear();os.environ['CG_SEED_PASSWORD']='common';os.environ['CG_DEMO_MODE']='1';server.init_db(True)
+        self.member=Client(self.base);self.member.login('member','common');self.owner=Client(self.base);self.owner.login('owner','common');self.admin=Client(self.base);self.admin.login('admin','common');self.manager=Client(self.base);self.manager.login('manager','common');self.new=Client(self.base);self.new.login('newcomer','common')
         self.day=date.fromisoformat(server.today())
     def tearDown(self):
         import gc

@@ -27,3 +27,13 @@
 .password-toggle:hover{color:var(--forest);background:var(--leaf)}
 .password-toggle:focus-visible{outline:3px solid #a05219;outline-offset:2px}
 .password-toggle svg{width:20px;height:20px}
+/* Sidebar: scroll instead of clipping on short windows */
+.sidebar{overflow-y:auto;overscroll-behavior:contain}
+.side-note,.person{flex:none}
+@media(min-width:761px) and (max-height:780px){
+ .sidebar{padding:18px 14px}
+ .sidebar .brand{padding-bottom:16px}
+ .org{margin-bottom:16px}
+ .side-note{display:none}
+ .person{margin-top:auto;padding-top:14px}
+}

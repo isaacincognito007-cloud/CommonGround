@@ -111,6 +111,105 @@ def init_postgres_db():
    'CREATE TABLE IF NOT EXISTS activity(id BIGSERIAL PRIMARY KEY,actor_id TEXT NOT NULL REFERENCES users(id),actor_role TEXT,resource_id TEXT REFERENCES resources(id),booking_id TEXT REFERENCES bookings(id),target_type TEXT,target_id TEXT,action TEXT NOT NULL,detail TEXT NOT NULL,from_status TEXT,to_status TEXT,reason TEXT,created TEXT NOT NULL)',
    'CREATE TABLE IF NOT EXISTS notifications(id BIGSERIAL PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),kind TEXT NOT NULL,title TEXT NOT NULL,body TEXT NOT NULL,link TEXT,created_at TEXT NOT NULL,read_at TEXT)'
   ): c.execute(statement)
+
+  # Helper to check if column exists in PostgreSQL
+  def pg_column_exists(table, column):
+   row = c.execute(
+    "SELECT 1 FROM information_schema.columns WHERE table_name=%s AND column_name=%s",
+    (table, column)
+   ).fetchone()
+   return row is not None
+
+  # Add verification_status columns to users (idempotent, with default 'unverified')
+  if not pg_column_exists('users', 'verification_status'):
+   c.execute("ALTER TABLE users ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'unverified'")
+  if not pg_column_exists('users', 'verification_note'):
+   c.execute("ALTER TABLE users ADD COLUMN verification_note TEXT")
+  if not pg_column_exists('users', 'verification_reason'):
+   c.execute("ALTER TABLE users ADD COLUMN verification_reason TEXT")
+  if not pg_column_exists('users', 'verification_requested_at'):
+   c.execute("ALTER TABLE users ADD COLUMN verification_requested_at TEXT")
+  if not pg_column_exists('users', 'verified_by'):
+   c.execute("ALTER TABLE users ADD COLUMN verified_by TEXT REFERENCES users(id)")
+  if not pg_column_exists('users', 'verified_at'):
+   c.execute("ALTER TABLE users ADD COLUMN verified_at TEXT")
+
+  # Add verification_status columns to resources (idempotent, with default 'unverified')
+  if not pg_column_exists('resources', 'verification_status'):
+   c.execute("ALTER TABLE resources ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'unverified'")
+  if not pg_column_exists('resources', 'verification_note'):
+   c.execute("ALTER TABLE resources ADD COLUMN verification_note TEXT")
+  if not pg_column_exists('resources', 'verification_reason'):
+   c.execute("ALTER TABLE resources ADD COLUMN verification_reason TEXT")
+  if not pg_column_exists('resources', 'verification_requested_at'):
+   c.execute("ALTER TABLE resources ADD COLUMN verification_requested_at TEXT")
+  if not pg_column_exists('resources', 'verified_by'):
+   c.execute("ALTER TABLE resources ADD COLUMN verified_by TEXT REFERENCES users(id)")
+  if not pg_column_exists('resources', 'verified_at'):
+   c.execute("ALTER TABLE resources ADD COLUMN verified_at TEXT")
+
+  # Add audit columns to activity table (idempotent; actor_role, target_type, target_id, from_status, to_status, reason already in CREATE TABLE)
+  # These columns are already in the CREATE TABLE IF NOT EXISTS, so they only exist if the table was created fresh
+  # For existing tables, check and add if missing
+  if not pg_column_exists('activity', 'actor_role'):
+   c.execute('ALTER TABLE activity ADD COLUMN actor_role TEXT')
+  if not pg_column_exists('activity', 'target_type'):
+   c.execute('ALTER TABLE activity ADD COLUMN target_type TEXT')
+  if not pg_column_exists('activity', 'target_id'):
+   c.execute('ALTER TABLE activity ADD COLUMN target_id TEXT')
+  if not pg_column_exists('activity', 'from_status'):
+   c.execute('ALTER TABLE activity ADD COLUMN from_status TEXT')
+  if not pg_column_exists('activity', 'to_status'):
+   c.execute('ALTER TABLE activity ADD COLUMN to_status TEXT')
+  if not pg_column_exists('activity', 'reason'):
+   c.execute('ALTER TABLE activity ADD COLUMN reason TEXT')
+
+  # Migrate notifications table schema if needed (idempotent, preserves existing rows)
+  # The CREATE TABLE IF NOT EXISTS already has the new schema, so only old tables need migration
+  if not pg_column_exists('notifications', 'kind'):
+   # Old schema detected; migrate
+   c.execute('''
+    CREATE TABLE IF NOT EXISTS notifications_new(
+     id BIGSERIAL PRIMARY KEY,
+     user_id TEXT NOT NULL REFERENCES users(id),
+     kind TEXT NOT NULL,
+     title TEXT NOT NULL,
+     body TEXT NOT NULL,
+     link TEXT,
+     created_at TEXT NOT NULL,
+     read_at TEXT
+    )
+   ''')
+   # Migrate existing data from old schema
+   c.execute('''
+    INSERT INTO notifications_new (user_id, kind, title, body, link, created_at, read_at)
+    SELECT user_id, 'info', 'Notification', message, NULL, created, NULL
+    FROM notifications
+   ''')
+   c.execute('DROP TABLE notifications')
+   c.execute('ALTER TABLE notifications_new RENAME TO notifications')
+   c.execute('CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id)')
+   c.execute('CREATE INDEX IF NOT EXISTS idx_notifications_read_at ON notifications(read_at)')
+
+  # Add verification_status CHECK constraint (idempotent; only if missing)
+  # PostgreSQL: check if constraint exists by querying pg_constraint
+  constraint_exists = c.execute(
+   "SELECT 1 FROM information_schema.table_constraints WHERE table_name='users' AND constraint_name='users_verification_status_check'",
+  ).fetchone()
+  if not constraint_exists:
+   c.execute(
+    "ALTER TABLE users ADD CONSTRAINT users_verification_status_check CHECK (verification_status IN ('unverified','pending','verified','rejected'))"
+   )
+
+  constraint_exists = c.execute(
+   "SELECT 1 FROM information_schema.table_constraints WHERE table_name='resources' AND constraint_name='resources_verification_status_check'",
+  ).fetchone()
+  if not constraint_exists:
+   c.execute(
+    "ALTER TABLE resources ADD CONSTRAINT resources_verification_status_check CHECK (verification_status IN ('unverified','pending','verified','rejected'))"
+   )
+
+  # Create or replace immutability trigger for activity (append-only enforcement)
   c.execute("CREATE OR REPLACE FUNCTION commonground_activity_immutable() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'Activity is append-only'; END; $$")
   c.execute('DROP TRIGGER IF EXISTS audit_no_update ON activity')
   c.execute('DROP TRIGGER IF EXISTS audit_no_delete ON activity')
@@ -360,7 +459,7 @@ class Handler(BaseHTTPRequestHandler):
        elif b['start']<=(datetime.now(TZ).date()+timedelta(days=1)).isoformat() and b['status']=='Approved': notify(c,u['id'],f'Collection reminder: {b["id"]} starts {b["start"]}.',f'reminder:{b["id"]}')
      activity=c.execute("SELECT a.*,u.name actor,r.name resource_name FROM activity a JOIN users u ON u.id=a.actor_id LEFT JOIN resources r ON r.id=a.resource_id LEFT JOIN bookings b ON b.id=a.booking_id WHERE b.user_id=? OR r.owner_id=? OR r.manager_id=? OR ?='admin' ORDER BY a.id DESC LIMIT 200",(u['id'],u['id'],u['id'],u['role'])).fetchall()
      people=[public_user(x) for x in c.execute("SELECT * FROM users WHERE role='member' ORDER BY name")] if u['role']=='admin' else []
-     result={'user':public_user(u),'today':today(),'resources':resources,'bookings':[booking_view(c,b,u) for b in visible],'activity':[dict(x) for x in activity],'notifications':[dict(x) for x in c.execute('SELECT * FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT 50',(u['id'],))],'people':people}
+     result={'user':public_user(u),'today':today(),'resources':resources,'bookings':[booking_view(c,b,u) for b in visible],'activity':[dict(x) for x in activity],'notifications':[dict(x) for x in c.execute('SELECT *,body AS message,created_at AS created FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT 50',(u['id'],))],'people':people}
      # Add demo accounts info in demo mode
      if DEMO_MODE:
          demo_accounts=c.execute("SELECT id, role FROM users WHERE id IN ('member','owner','manager','admin') ORDER BY role DESC").fetchall()
@@ -511,10 +610,12 @@ class Handler(BaseHTTPRequestHandler):
      if not isinstance(verified,bool) or not isinstance(credentials,list) or len(credentials)>20 or any(not isinstance(x,str) or not 1<=len(x)<=100 for x in credentials): fail('invalid_field','credentials','Supply membership status and a list of training names.')
      from_status = 'unverified' if not person['verified'] else 'verified'
      to_status = 'verified' if verified else 'unverified'
-     if from_status == to_status: fail('invalid_transition','status','No status change.',409)
+     try: old_credentials=json.loads(person['credentials'] or '[]')
+     except Exception: old_credentials=[]
+     if from_status == to_status and old_credentials == list(dict.fromkeys(credentials)): fail('invalid_transition','status','Nothing to change: membership status and training names are the same as before.',409)
      c.execute('UPDATE users SET verified=?,credentials=?,verification_status=?,verification_reason=?,verified_by=?,verified_at=? WHERE id=?',(verified,json.dumps(list(dict.fromkeys(credentials))),to_status,reason,u['id'],now(),target))
      audit(c,u['id'],None,None,'Verification reviewed',u['role'],'user',target,from_status,to_status,reason)
-     notify(c,target,f'Your verification has been reviewed. {reason}')
+     notify(c,target,(f'Your account has been verified. Review note: {reason}' if to_status=='verified' else f'Your account verification was updated to unverified. Review note: {reason}') if from_status!=to_status else f'Your training and membership details were reviewed and updated. Review note: {reason}')
      c.commit(); return self.send_json({'ok':True})
     if path=='/api/verification/request':
      if u['role'] not in ('member','owner','manager','admin'): fail('forbidden','role','Only authenticated users can request verification.',403)
