@@ -37,7 +37,7 @@ def _ensure_database() -> None:
     with _INIT_LOCK:
         if _INITIALIZED:
             return
-        if os.environ.get("VERCEL") == "1" and not server.PG_DSN:
+        if os.environ.get("VERCEL") == "1" and not server.get_database_url():
             raise RuntimeError("Set DATABASE_URL or POSTGRES_URL for persistent Vercel storage.")
         server.init_db(seed=False)
         _INITIALIZED = True
