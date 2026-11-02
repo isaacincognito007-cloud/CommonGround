@@ -9,7 +9,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from view import HTML
 ROOT=Path(__file__).resolve().parent
 DB=os.environ.get('CG_DB',str(ROOT/'data'/'commonground.sqlite3'))
-PG_DSN=os.environ.get('DATABASE_URL') or os.environ.get('POSTGRES_URL') or ''
+def get_database_url():
+ """Get DATABASE_URL at runtime. Returns empty string if not configured."""
+ return os.environ.get('DATABASE_URL') or os.environ.get('POSTGRES_URL') or ''
 try:
  TZ=ZoneInfo('Asia/Kolkata')
 except ZoneInfoNotFoundError:
@@ -33,8 +35,19 @@ class PgRow(dict):
   if key=='end' and 'end_date' in self: key='end_date'
   return super().__getitem__(key)
 def pg_row_factory(cursor):
- names=[column.name for column in cursor.description]
- def build(values): return PgRow((('end' if name=='end_date' else name,value) for name,value in zip(names,values)))
+ # Handle statements with no result set (DDL, DML without RETURNING)
+ if cursor.description is None:
+  return lambda values: None
+ # Use psycopg's dict_row as base, then wrap to handle end/end_date alias
+ import psycopg.rows
+ base_factory = psycopg.rows.dict_row(cursor)
+ def build(values):
+  row = base_factory(values)
+  # Alias end_date to end for compatibility with existing code
+  if isinstance(row, dict) and 'end_date' in row and 'end' not in row:
+   row = PgRow(row)
+   row['end'] = row['end_date']
+  return PgRow(row) if isinstance(row, dict) else row
  return build
 def postgres_sql(statement):
  if statement.lstrip().upper().startswith('CREATE OR REPLACE FUNCTION'): return statement
@@ -58,13 +71,46 @@ class PgConnection:
  def execute(self,statement,params=()):
   if statement.strip().upper()=='BEGIN IMMEDIATE':
    cursor=self.raw.cursor(); cursor.execute('SELECT pg_advisory_xact_lock(%s)',(734000000001,)); return cursor
-  cursor=self.raw.cursor(); cursor.execute(postgres_sql(statement),params or ()); return cursor
+  cursor=self.raw.cursor()
+  cursor.execute(postgres_sql(statement),params or ())
+  return cursor
 def connect():
- if PG_DSN:
-  import psycopg
-  return PgConnection(psycopg.connect(PG_DSN,row_factory=pg_row_factory))
- c=sqlite3.connect(DB,timeout=15,factory=Connection); c.row_factory=sqlite3.Row
- c.execute('PRAGMA foreign_keys=ON'); c.execute('PRAGMA busy_timeout=15000'); return c
+ """
+ Get database connection.
+
+ LOCAL DEVELOPMENT (no DATABASE_URL):
+  - Returns SQLite connection
+  - Existing .data/commonground.sqlite3 used
+
+ PRODUCTION (DATABASE_URL set):
+  - Returns PostgreSQL connection
+  - Fails clearly if connection fails
+  - Never silently falls back to SQLite
+  - Does not expose connection string
+ """
+ db_url=get_database_url()
+ is_production = os.environ.get('VERCEL')=='1' or os.environ.get('CG_PRODUCTION')=='1'
+
+ if not db_url:
+  if is_production:
+   raise RuntimeError('DATABASE_URL or POSTGRES_URL must be set in production. Configure a PostgreSQL connection string.')
+  # Local development: use SQLite
+  c=sqlite3.connect(DB,timeout=15,factory=Connection); c.row_factory=sqlite3.Row
+  c.execute('PRAGMA foreign_keys=ON'); c.execute('PRAGMA busy_timeout=15000'); return c
+
+ # Production or explicit DATABASE_URL: use PostgreSQL
+ import psycopg
+ try:
+  return PgConnection(psycopg.connect(db_url,row_factory=pg_row_factory))
+ except Exception as e:
+  # Production environment: fail clearly, do not fall back to SQLite
+  if is_production:
+   raise RuntimeError('Failed to connect to PostgreSQL database. Verify DATABASE_URL is valid.')
+  # Development: warn and fall back to SQLite
+  import sys
+  print(f'Warning: PostgreSQL connection failed ({type(e).__name__}), using SQLite', file=sys.stderr)
+  c=sqlite3.connect(DB,timeout=15,factory=Connection); c.row_factory=sqlite3.Row
+  c.execute('PRAGMA foreign_keys=ON'); c.execute('PRAGMA busy_timeout=15000'); return c
 def password_hash(password,salt=None):
  salt=salt or secrets.token_hex(16)
  return salt+':'+hashlib.scrypt(password.encode(),salt=salt.encode(),n=16384,r=8,p=1).hex()
@@ -216,167 +262,188 @@ def init_postgres_db():
   c.execute('CREATE TRIGGER audit_no_update BEFORE UPDATE ON activity FOR EACH ROW EXECUTE FUNCTION commonground_activity_immutable()')
   c.execute('CREATE TRIGGER audit_no_delete BEFORE DELETE ON activity FOR EACH ROW EXECUTE FUNCTION commonground_activity_immutable()')
 def init_db(seed=False):
- if PG_DSN:
-  init_postgres_db()
-  if seed: raise SystemExit('Fictional --seed accounts are local-only; use vercel_bootstrap.py for real PostgreSQL accounts.')
+ """
+ Initialize database.
+
+ LOCAL DEVELOPMENT (no DATABASE_URL):
+  - Creates/initializes SQLite database at .data/commonground.sqlite3
+  - Supports --seed for demo accounts
+
+ PRODUCTION (DATABASE_URL set):
+  - Calls init_postgres_db()
+  - Does not support --seed (use vercel_bootstrap.py instead)
+  - Fails if DATABASE_URL is invalid
+ """
+ db_url=get_database_url()
+ is_production = os.environ.get('VERCEL')=='1' or os.environ.get('CG_PRODUCTION')=='1'
+
+ if not db_url:
+  if is_production:
+   raise RuntimeError('DATABASE_URL or POSTGRES_URL must be set in production. Configure a PostgreSQL connection string.')
+  # Local development: use SQLite
+  Path(DB).parent.mkdir(parents=True,exist_ok=True)
+  with connect() as c:
+   c.executescript('''
+   PRAGMA journal_mode=WAL;
+   CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,name TEXT NOT NULL,email TEXT UNIQUE NOT NULL,password TEXT NOT NULL,role TEXT NOT NULL,group_name TEXT NOT NULL,verified INTEGER NOT NULL DEFAULT 0,credentials TEXT NOT NULL DEFAULT '[]');
+   CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),csrf TEXT NOT NULL,expires REAL NOT NULL);
+   CREATE TABLE IF NOT EXISTS resources(id TEXT PRIMARY KEY,name TEXT NOT NULL,category TEXT NOT NULL,location TEXT NOT NULL,description TEXT NOT NULL,rules TEXT NOT NULL,training TEXT NOT NULL,available_from TEXT NOT NULL,available_to TEXT NOT NULL,owner_id TEXT NOT NULL REFERENCES users(id),manager_id TEXT REFERENCES users(id),active INTEGER NOT NULL DEFAULT 1);
+   CREATE TABLE IF NOT EXISTS bookings(id TEXT PRIMARY KEY,resource_id TEXT NOT NULL REFERENCES resources(id),user_id TEXT NOT NULL REFERENCES users(id),start TEXT NOT NULL,end TEXT NOT NULL,purpose TEXT NOT NULL,status TEXT NOT NULL,reason TEXT NOT NULL,created TEXT NOT NULL,before_note TEXT,after_note TEXT,checked_in TEXT,returned TEXT,idempotency TEXT NOT NULL,request_hash TEXT NOT NULL,UNIQUE(user_id,idempotency));
+   CREATE INDEX IF NOT EXISTS booking_calendar ON bookings(resource_id,status,start,end);
+   CREATE TABLE IF NOT EXISTS incidents(id TEXT PRIMARY KEY,booking_id TEXT NOT NULL REFERENCES bookings(id),reporter_id TEXT NOT NULL REFERENCES users(id),kind TEXT NOT NULL,description TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'Open',resolution TEXT,created TEXT NOT NULL);
+   CREATE TABLE IF NOT EXISTS activity(id INTEGER PRIMARY KEY AUTOINCREMENT,actor_id TEXT NOT NULL REFERENCES users(id),actor_role TEXT,resource_id TEXT REFERENCES resources(id),booking_id TEXT REFERENCES bookings(id),target_type TEXT,target_id TEXT,action TEXT NOT NULL,detail TEXT NOT NULL,from_status TEXT,to_status TEXT,reason TEXT,created TEXT NOT NULL);
+   CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id TEXT NOT NULL REFERENCES users(id),kind TEXT NOT NULL,title TEXT NOT NULL,body TEXT NOT NULL,link TEXT,created_at TEXT NOT NULL,read_at TEXT);
+   CREATE TRIGGER IF NOT EXISTS audit_no_update BEFORE UPDATE ON activity BEGIN SELECT RAISE(ABORT,'Activity is append-only'); END;
+   CREATE TRIGGER IF NOT EXISTS audit_no_delete BEFORE DELETE ON activity BEGIN SELECT RAISE(ABORT,'Activity is append-only'); END;
+   ''')
+   # Migration: Add verification columns (idempotent)
+   # Helper to check column exists
+   def column_exists(table, column):
+     row = c.execute(f"PRAGMA table_info({table})").fetchone()
+     while row:
+       if row['name'] == column:
+         return True
+       row = c.execute(f"PRAGMA table_info({table})").fetchmany(1)
+     return False
+
+   # Actually check properly
+   def check_column(table, column):
+     cols = [row['name'] for row in c.execute(f"PRAGMA table_info({table})")]
+     return column in cols
+
+   # Users verification columns
+   if not check_column('users', 'verification_status'):
+     c.execute("ALTER TABLE users ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'unverified'")
+   if not check_column('users', 'verification_note'):
+     c.execute("ALTER TABLE users ADD COLUMN verification_note TEXT")
+   if not check_column('users', 'verification_reason'):
+     c.execute("ALTER TABLE users ADD COLUMN verification_reason TEXT")
+   if not check_column('users', 'verification_requested_at'):
+     c.execute("ALTER TABLE users ADD COLUMN verification_requested_at TEXT")
+   if not check_column('users', 'verified_by'):
+     c.execute("ALTER TABLE users ADD COLUMN verified_by TEXT REFERENCES users(id)")
+   if not check_column('users', 'verified_at'):
+     c.execute("ALTER TABLE users ADD COLUMN verified_at TEXT")
+
+   # Resources verification columns
+   if not check_column('resources', 'verification_status'):
+     c.execute("ALTER TABLE resources ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'unverified'")
+   if not check_column('resources', 'verification_note'):
+     c.execute("ALTER TABLE resources ADD COLUMN verification_note TEXT")
+   if not check_column('resources', 'verification_reason'):
+     c.execute("ALTER TABLE resources ADD COLUMN verification_reason TEXT")
+   if not check_column('resources', 'verification_requested_at'):
+     c.execute("ALTER TABLE resources ADD COLUMN verification_requested_at TEXT")
+   if not check_column('resources', 'verified_by'):
+     c.execute("ALTER TABLE resources ADD COLUMN verified_by TEXT REFERENCES users(id)")
+   if not check_column('resources', 'verified_at'):
+     c.execute("ALTER TABLE resources ADD COLUMN verified_at TEXT")
+
+   # Create indexes
+   c.execute("CREATE INDEX IF NOT EXISTS idx_users_verification_status ON users(verification_status)")
+   c.execute("CREATE INDEX IF NOT EXISTS idx_resources_verification_status ON resources(verification_status)")
+
+   # Migrate notifications table to new schema (kind, title, body, link, read_at)
+   # Check if old columns exist
+   notif_cols = [row['name'] for row in c.execute("PRAGMA table_info(notifications)")]
+   if 'kind' not in notif_cols:
+     # Recreate notifications table with new schema
+     c.execute('''
+       CREATE TABLE IF NOT EXISTS notifications_new(
+         id INTEGER PRIMARY KEY AUTOINCREMENT,
+         user_id TEXT NOT NULL REFERENCES users(id),
+         kind TEXT NOT NULL,
+         title TEXT NOT NULL,
+         body TEXT NOT NULL,
+         link TEXT,
+         created_at TEXT NOT NULL,
+         read_at TEXT
+       )
+     ''')
+     # Migrate existing data
+     c.execute('''
+       INSERT INTO notifications_new (user_id, kind, title, body, link, created_at, read_at)
+       SELECT user_id, 'info', 'Notification', message, NULL, created, NULL
+       FROM notifications
+     ''')
+     c.execute('DROP TABLE notifications')
+     c.execute('ALTER TABLE notifications_new RENAME TO notifications')
+     c.execute('CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id)')
+     c.execute('CREATE INDEX IF NOT EXISTS idx_notifications_read_at ON notifications(read_at)')
+
+   # Migration: Add audit columns to activity table (idempotent)
+   activity_cols = [row['name'] for row in c.execute("PRAGMA table_info(activity)")]
+   if 'actor_role' not in activity_cols:
+     c.execute('ALTER TABLE activity ADD COLUMN actor_role TEXT')
+   if 'target_type' not in activity_cols:
+     c.execute('ALTER TABLE activity ADD COLUMN target_type TEXT')
+   if 'target_id' not in activity_cols:
+     c.execute('ALTER TABLE activity ADD COLUMN target_id TEXT')
+   if 'from_status' not in activity_cols:
+     c.execute('ALTER TABLE activity ADD COLUMN from_status TEXT')
+   if 'to_status' not in activity_cols:
+     c.execute('ALTER TABLE activity ADD COLUMN to_status TEXT')
+   if 'reason' not in activity_cols:
+     c.execute('ALTER TABLE activity ADD COLUMN reason TEXT')
+
+   # Add BEFORE INSERT/UPDATE triggers to enforce valid verification_status values (SQLite)
+   # Since we can't add CHECK constraint to existing column, use triggers
+   c.execute('''
+     CREATE TRIGGER IF NOT EXISTS users_verification_status_check BEFORE INSERT ON users
+     BEGIN
+       SELECT CASE
+         WHEN NEW.verification_status NOT IN ('unverified','pending','verified','rejected')
+         THEN RAISE(ABORT, 'Invalid verification_status')
+       END;
+     END
+   ''')
+   c.execute('''
+     CREATE TRIGGER IF NOT EXISTS users_verification_status_check_update BEFORE UPDATE ON users
+     BEGIN
+       SELECT CASE
+         WHEN NEW.verification_status NOT IN ('unverified','pending','verified','rejected')
+         THEN RAISE(ABORT, 'Invalid verification_status')
+       END;
+     END
+   ''')
+   c.execute('''
+     CREATE TRIGGER IF NOT EXISTS resources_verification_status_check BEFORE INSERT ON resources
+     BEGIN
+       SELECT CASE
+         WHEN NEW.verification_status NOT IN ('unverified','pending','verified','rejected')
+         THEN RAISE(ABORT, 'Invalid verification_status')
+       END;
+     END
+   ''')
+   c.execute('''
+     CREATE TRIGGER IF NOT EXISTS resources_verification_status_check_update BEFORE UPDATE ON resources
+     BEGIN
+       SELECT CASE
+         WHEN NEW.verification_status NOT IN ('unverified','pending','verified','rejected')
+         THEN RAISE(ABORT, 'Invalid verification_status')
+       END;
+     END
+   ''')
+
+   if seed and not c.execute('SELECT 1 FROM users LIMIT 1').fetchone():
+    password=os.environ.get('CG_SEED_PASSWORD','')
+    # Demo mode: allow short passwords for seeded accounts only
+    is_demo = DEMO_MODE
+    if not is_demo and len(password) < 12: raise SystemExit('Set CG_SEED_PASSWORD to a unique password of at least 12 characters before --seed.')
+    # For demo mode, use password as-is (even if short); for normal mode, enforce 12+
+    effective_password = password if is_demo else (password if len(password) >= 12 else password + 'X' * (12 - len(password)))
+    users=[('member','Aarav Mehta','member','Open Studio',1,['Workshop induction']),('newcomer','Mira Rao','member','Design Collective',0,[]),('owner','Ananya Shah','owner','Campus Makerspace',1,['Workshop induction','Laser safety']),('manager','Rohan Sen','manager','Campus Makerspace',1,['Workshop induction','Laser safety']),('admin','Campus Administrator','admin','Campus Services',1,[])]
+    for uid,name,role,group,verified,training in users: c.execute('INSERT INTO users VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(uid,name,uid+'@campus.example',password_hash(effective_password),role,group,verified,json.dumps(training),'unverified',None,None,None,None,None))
+    start,end=today(),(datetime.now(TZ).date()+timedelta(days=180)).isoformat()
+    items=[('camera','Sony Alpha field kit','Photography','Media Lab · Block B','A mirrorless camera, two lenses, tripod and audio recorder for fieldwork and creative projects.','Collect from the equipment desk. Keep the kit dry. Return all labelled accessories.','Workshop induction'),('laser','Precision laser cutter','Fabrication','Fabrication Lab · Block A','A supervised 60W laser workstation for approved sheet materials and precise fabrication.','A qualified staff supervisor must be present. No PVC or unknown materials.','Laser safety'),('studio','Collaboration studio','Spaces','Innovation Centre · Level 1','A quiet, accessible room for eight with a whiteboard, display and adjustable desks.','Keep the accessible route clear. Leave the room ready for the next group.',''),('scope','Digital microscope','Research','Materials Lab · Block C','High-resolution inspection and image capture for non-hazardous material samples.','Non-biological samples only. Clean the stage and cover the unit after use.','Workshop induction')]
+    for rid,name,cat,loc,desc,rules,training in items:
+     c.execute('INSERT INTO resources VALUES(?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?)',(rid,name,cat,loc,desc,rules,training,start,end,'owner','manager','unverified',None,None,None,None,None)); audit(c,'owner',rid,None,'Resource listed',name)
   return
- Path(DB).parent.mkdir(parents=True,exist_ok=True)
- with connect() as c:
-  c.executescript('''
-  PRAGMA journal_mode=WAL;
-  CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,name TEXT NOT NULL,email TEXT UNIQUE NOT NULL,password TEXT NOT NULL,role TEXT NOT NULL,group_name TEXT NOT NULL,verified INTEGER NOT NULL DEFAULT 0,credentials TEXT NOT NULL DEFAULT '[]');
-  CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),csrf TEXT NOT NULL,expires REAL NOT NULL);
-  CREATE TABLE IF NOT EXISTS resources(id TEXT PRIMARY KEY,name TEXT NOT NULL,category TEXT NOT NULL,location TEXT NOT NULL,description TEXT NOT NULL,rules TEXT NOT NULL,training TEXT NOT NULL,available_from TEXT NOT NULL,available_to TEXT NOT NULL,owner_id TEXT NOT NULL REFERENCES users(id),manager_id TEXT REFERENCES users(id),active INTEGER NOT NULL DEFAULT 1);
-  CREATE TABLE IF NOT EXISTS bookings(id TEXT PRIMARY KEY,resource_id TEXT NOT NULL REFERENCES resources(id),user_id TEXT NOT NULL REFERENCES users(id),start TEXT NOT NULL,end TEXT NOT NULL,purpose TEXT NOT NULL,status TEXT NOT NULL,reason TEXT NOT NULL,created TEXT NOT NULL,before_note TEXT,after_note TEXT,checked_in TEXT,returned TEXT,idempotency TEXT NOT NULL,request_hash TEXT NOT NULL,UNIQUE(user_id,idempotency));
-  CREATE INDEX IF NOT EXISTS booking_calendar ON bookings(resource_id,status,start,end);
-  CREATE TABLE IF NOT EXISTS incidents(id TEXT PRIMARY KEY,booking_id TEXT NOT NULL REFERENCES bookings(id),reporter_id TEXT NOT NULL REFERENCES users(id),kind TEXT NOT NULL,description TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'Open',resolution TEXT,created TEXT NOT NULL);
-  CREATE TABLE IF NOT EXISTS activity(id INTEGER PRIMARY KEY AUTOINCREMENT,actor_id TEXT NOT NULL REFERENCES users(id),actor_role TEXT,resource_id TEXT REFERENCES resources(id),booking_id TEXT REFERENCES bookings(id),target_type TEXT,target_id TEXT,action TEXT NOT NULL,detail TEXT NOT NULL,from_status TEXT,to_status TEXT,reason TEXT,created TEXT NOT NULL);
-  CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id TEXT NOT NULL REFERENCES users(id),kind TEXT NOT NULL,title TEXT NOT NULL,body TEXT NOT NULL,link TEXT,created_at TEXT NOT NULL,read_at TEXT);
-  CREATE TRIGGER IF NOT EXISTS audit_no_update BEFORE UPDATE ON activity BEGIN SELECT RAISE(ABORT,'Activity is append-only'); END;
-  CREATE TRIGGER IF NOT EXISTS audit_no_delete BEFORE DELETE ON activity BEGIN SELECT RAISE(ABORT,'Activity is append-only'); END;
-  ''')
-  # Migration: Add verification columns (idempotent)
-  # Helper to check column exists
-  def column_exists(table, column):
-    row = c.execute(f"PRAGMA table_info({table})").fetchone()
-    while row:
-      if row['name'] == column:
-        return True
-      row = c.execute(f"PRAGMA table_info({table})").fetchmany(1)
-    return False
 
-  # Actually check properly
-  def check_column(table, column):
-    cols = [row['name'] for row in c.execute(f"PRAGMA table_info({table})")]
-    return column in cols
-
-  # Users verification columns
-  if not check_column('users', 'verification_status'):
-    c.execute("ALTER TABLE users ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'unverified'")
-  if not check_column('users', 'verification_note'):
-    c.execute("ALTER TABLE users ADD COLUMN verification_note TEXT")
-  if not check_column('users', 'verification_reason'):
-    c.execute("ALTER TABLE users ADD COLUMN verification_reason TEXT")
-  if not check_column('users', 'verification_requested_at'):
-    c.execute("ALTER TABLE users ADD COLUMN verification_requested_at TEXT")
-  if not check_column('users', 'verified_by'):
-    c.execute("ALTER TABLE users ADD COLUMN verified_by TEXT REFERENCES users(id)")
-  if not check_column('users', 'verified_at'):
-    c.execute("ALTER TABLE users ADD COLUMN verified_at TEXT")
-
-  # Resources verification columns
-  if not check_column('resources', 'verification_status'):
-    c.execute("ALTER TABLE resources ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'unverified'")
-  if not check_column('resources', 'verification_note'):
-    c.execute("ALTER TABLE resources ADD COLUMN verification_note TEXT")
-  if not check_column('resources', 'verification_reason'):
-    c.execute("ALTER TABLE resources ADD COLUMN verification_reason TEXT")
-  if not check_column('resources', 'verification_requested_at'):
-    c.execute("ALTER TABLE resources ADD COLUMN verification_requested_at TEXT")
-  if not check_column('resources', 'verified_by'):
-    c.execute("ALTER TABLE resources ADD COLUMN verified_by TEXT REFERENCES users(id)")
-  if not check_column('resources', 'verified_at'):
-    c.execute("ALTER TABLE resources ADD COLUMN verified_at TEXT")
-
-  # Create indexes
-  c.execute("CREATE INDEX IF NOT EXISTS idx_users_verification_status ON users(verification_status)")
-  c.execute("CREATE INDEX IF NOT EXISTS idx_resources_verification_status ON resources(verification_status)")
-
-  # Migrate notifications table to new schema (kind, title, body, link, read_at)
-  # Check if old columns exist
-  notif_cols = [row['name'] for row in c.execute("PRAGMA table_info(notifications)")]
-  if 'kind' not in notif_cols:
-    # Recreate notifications table with new schema
-    c.execute('''
-      CREATE TABLE IF NOT EXISTS notifications_new(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id TEXT NOT NULL REFERENCES users(id),
-        kind TEXT NOT NULL,
-        title TEXT NOT NULL,
-        body TEXT NOT NULL,
-        link TEXT,
-        created_at TEXT NOT NULL,
-        read_at TEXT
-      )
-    ''')
-    # Migrate existing data
-    c.execute('''
-      INSERT INTO notifications_new (user_id, kind, title, body, link, created_at, read_at)
-      SELECT user_id, 'info', 'Notification', message, NULL, created, NULL
-      FROM notifications
-    ''')
-    c.execute('DROP TABLE notifications')
-    c.execute('ALTER TABLE notifications_new RENAME TO notifications')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_notifications_read_at ON notifications(read_at)')
-
-  # Migration: Add audit columns to activity table (idempotent)
-  activity_cols = [row['name'] for row in c.execute("PRAGMA table_info(activity)")]
-  if 'actor_role' not in activity_cols:
-    c.execute('ALTER TABLE activity ADD COLUMN actor_role TEXT')
-  if 'target_type' not in activity_cols:
-    c.execute('ALTER TABLE activity ADD COLUMN target_type TEXT')
-  if 'target_id' not in activity_cols:
-    c.execute('ALTER TABLE activity ADD COLUMN target_id TEXT')
-  if 'from_status' not in activity_cols:
-    c.execute('ALTER TABLE activity ADD COLUMN from_status TEXT')
-  if 'to_status' not in activity_cols:
-    c.execute('ALTER TABLE activity ADD COLUMN to_status TEXT')
-  if 'reason' not in activity_cols:
-    c.execute('ALTER TABLE activity ADD COLUMN reason TEXT')
-
-  # Add BEFORE INSERT/UPDATE triggers to enforce valid verification_status values (SQLite)
-  # Since we can't add CHECK constraint to existing column, use triggers
-  c.execute('''
-    CREATE TRIGGER IF NOT EXISTS users_verification_status_check BEFORE INSERT ON users
-    BEGIN
-      SELECT CASE
-        WHEN NEW.verification_status NOT IN ('unverified','pending','verified','rejected')
-        THEN RAISE(ABORT, 'Invalid verification_status')
-      END;
-    END
-  ''')
-  c.execute('''
-    CREATE TRIGGER IF NOT EXISTS users_verification_status_check_update BEFORE UPDATE ON users
-    BEGIN
-      SELECT CASE
-        WHEN NEW.verification_status NOT IN ('unverified','pending','verified','rejected')
-        THEN RAISE(ABORT, 'Invalid verification_status')
-      END;
-    END
-  ''')
-  c.execute('''
-    CREATE TRIGGER IF NOT EXISTS resources_verification_status_check BEFORE INSERT ON resources
-    BEGIN
-      SELECT CASE
-        WHEN NEW.verification_status NOT IN ('unverified','pending','verified','rejected')
-        THEN RAISE(ABORT, 'Invalid verification_status')
-      END;
-    END
-  ''')
-  c.execute('''
-    CREATE TRIGGER IF NOT EXISTS resources_verification_status_check_update BEFORE UPDATE ON resources
-    BEGIN
-      SELECT CASE
-        WHEN NEW.verification_status NOT IN ('unverified','pending','verified','rejected')
-        THEN RAISE(ABORT, 'Invalid verification_status')
-      END;
-    END
-  ''')
-
-  if seed and not c.execute('SELECT 1 FROM users LIMIT 1').fetchone():
-   password=os.environ.get('CG_SEED_PASSWORD','')
-   # Demo mode: allow short passwords for seeded accounts only
-   is_demo = DEMO_MODE
-   if not is_demo and len(password) < 12: raise SystemExit('Set CG_SEED_PASSWORD to a unique password of at least 12 characters before --seed.')
-   # For demo mode, use password as-is (even if short); for normal mode, enforce 12+
-   effective_password = password if is_demo else (password if len(password) >= 12 else password + 'X' * (12 - len(password)))
-   users=[('member','Aarav Mehta','member','Open Studio',1,['Workshop induction']),('newcomer','Mira Rao','member','Design Collective',0,[]),('owner','Ananya Shah','owner','Campus Makerspace',1,['Workshop induction','Laser safety']),('manager','Rohan Sen','manager','Campus Makerspace',1,['Workshop induction','Laser safety']),('admin','Campus Administrator','admin','Campus Services',1,[])]
-   for uid,name,role,group,verified,training in users: c.execute('INSERT INTO users VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(uid,name,uid+'@campus.example',password_hash(effective_password),role,group,verified,json.dumps(training),'unverified',None,None,None,None,None))
-   start,end=today(),(datetime.now(TZ).date()+timedelta(days=180)).isoformat()
-   items=[('camera','Sony Alpha field kit','Photography','Media Lab · Block B','A mirrorless camera, two lenses, tripod and audio recorder for fieldwork and creative projects.','Collect from the equipment desk. Keep the kit dry. Return all labelled accessories.','Workshop induction'),('laser','Precision laser cutter','Fabrication','Fabrication Lab · Block A','A supervised 60W laser workstation for approved sheet materials and precise fabrication.','A qualified staff supervisor must be present. No PVC or unknown materials.','Laser safety'),('studio','Collaboration studio','Spaces','Innovation Centre · Level 1','A quiet, accessible room for eight with a whiteboard, display and adjustable desks.','Keep the accessible route clear. Leave the room ready for the next group.',''),('scope','Digital microscope','Research','Materials Lab · Block C','High-resolution inspection and image capture for non-hazardous material samples.','Non-biological samples only. Clean the stage and cover the unit after use.','Workshop induction')]
-   for rid,name,cat,loc,desc,rules,training in items:
-    c.execute('INSERT INTO resources VALUES(?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?)',(rid,name,cat,loc,desc,rules,training,start,end,'owner','manager','unverified',None,None,None,None,None)); audit(c,'owner',rid,None,'Resource listed',name)
+ # Production: DATABASE_URL is configured, use PostgreSQL
+ init_postgres_db()
+ if seed:
+  raise SystemExit('Fictional --seed accounts are local-only; use vercel_bootstrap.py for real PostgreSQL accounts.')
 def manages(u,r): return u['role']=='admin' or u['id'] in (r['owner_id'],r['manager_id'])
 def resource(c,rid):
  r=c.execute('SELECT * FROM resources WHERE id=?',(rid,)).fetchone()
@@ -445,9 +512,10 @@ class Handler(BaseHTTPRequestHandler):
     if path=='/api/health': c.execute('SELECT 1'); return self.send_json({'ok':True,'timezone':'Asia/Kolkata'})
     if path=='/api/demo-accounts':
      if not DEMO_MODE:
-      return self.send_json({'accounts':[]})
+      return self.send_json({'accounts':[],'password':''})
      accounts=c.execute("SELECT id, role, email FROM users WHERE id IN ('member','owner','manager','admin') ORDER BY role DESC").fetchall()
-     return self.send_json({'accounts':[{'role':r['role'],'email':r['email']} for r in accounts]})
+     demo_password=os.environ.get('CG_SEED_PASSWORD','commonground')
+     return self.send_json({'accounts':[{'role':r['role'],'email':r['email']} for r in accounts],'password':demo_password})
     u,s=self.auth(c)
     if path=='/api/session': return self.send_json({'user':public_user(u),'csrf':s['csrf'],'today':today()})
     if path=='/api/state':

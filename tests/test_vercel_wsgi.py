@@ -25,9 +25,8 @@ class VercelWSGITests(unittest.TestCase):
         if str(ROOT) not in sys.path:
             sys.path.insert(0, str(ROOT))
         cls.server = importlib.import_module("server")
-        cls._saved_server_state = {name: getattr(cls.server, name) for name in ("DB", "PG_DSN", "PUBLIC_ORIGIN", "SECURE")}
+        cls._saved_server_state = {name: getattr(cls.server, name) for name in ("DB", "PUBLIC_ORIGIN", "SECURE")}
         cls.server.DB = os.environ["CG_DB"]
-        cls.server.PG_DSN = ""
         cls.server.PUBLIC_ORIGIN = ""
         cls.server.SECURE = False
         cls.api = importlib.import_module("api.index")
