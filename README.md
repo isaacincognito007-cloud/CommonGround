@@ -126,9 +126,9 @@ Set `CG_DEMO_MODE=1` for a demo deployment with pre-seeded accounts:
 
 | Role | Account | Password |
 |---|---|---|
-| Member | `member@campus.example` | demo-password-123 |
-| Owner | `owner@campus.example` | demo-password-123 |
-| Manager | `manager@campus.example` | demo-password-123 |
+| Member | `member@campus.example` | commonground |
+| Owner | `owner@campus.example` | commonground |
+| Manager | `manager@campus.example` | commonground |
 
 For the judge deployment, set:
 ```bash
